@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"  // Add regexp import
 	"strings" // Add strings import
 
 	// "fmt" // No longer needed after error handling changes
@@ -496,18 +497,30 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 	// Parse Content-Range header (e.g., "0-999")
 	contentRange := r.Header.Get("Content-Range")
 	var startOffset, endOffset int64
-	if contentRange != "" {
-		// Note: The spec says range MUST be inclusive, e.g., 0-999 for 1000 bytes.
-		// fmt.Sscanf is simple but might be too lenient. A regex might be better.
-		_, err := fmt.Sscanf(contentRange, "%d-%d", &startOffset, &endOffset)
-		if err != nil || startOffset < 0 || endOffset < startOffset {
-			reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header format", http.StatusRequestedRangeNotSatisfiable, err)
-			return
-		}
-	} else {
-		// Content-Range is required for PATCH according to spec? Let's assume yes for now.
-		// If not provided, maybe try to infer from Content-Length if offset is 0? Risky.
-		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Missing Content-Range header", http.StatusBadRequest, nil)
+	contentRangeRegex := regexp.MustCompile(`^([0-9]+)-([0-9]+)$`) // Regex for byte range
+	matches := contentRangeRegex.FindStringSubmatch(contentRange)
+
+	if len(matches) != 3 {
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header format", http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("invalid range format: %s", contentRange))
+		return
+	}
+
+	var err error
+	startOffset, err = strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		// Should not happen with regex match, but check anyway
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range start offset", http.StatusRequestedRangeNotSatisfiable, err)
+		return
+	}
+	endOffset, err = strconv.ParseInt(matches[2], 10, 64)
+	if err != nil {
+		// Should not happen with regex match
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range end offset", http.StatusRequestedRangeNotSatisfiable, err)
+		return
+	}
+
+	if endOffset < startOffset {
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header: end offset cannot be less than start offset", http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("invalid range %d-%d", startOffset, endOffset))
 		return
 	}
 
