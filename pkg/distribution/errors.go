@@ -34,6 +34,9 @@ const (
 
 	// Internal/Catch-all
 	ErrorCodeUnknown ErrorCode = "UNKNOWN" // unknown error
+
+	// Custom/Implementation Specific (Not in OCI Spec)
+	ErrorCodePaginationInvalid ErrorCode = "PAGINATION_INVALID" // Invalid pagination parameters
 )
 
 // String returns the string representation of the ErrorCode.

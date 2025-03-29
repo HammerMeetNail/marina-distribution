@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings" // Add strings import
 
 	// "fmt" // No longer needed after error handling changes
 	"io"
@@ -623,8 +624,105 @@ func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request
 	reg.log.Printf("Finished blob upload for %s/%s, final digest: %s", repoName, uploadID, finalDigest)
 }
 
+// --- Tag Handlers ---
+
+// GetTagsHandler lists tags for a repository.
+// Pattern: GET /v2/{name}/tags/list
+func (reg *Registry) GetTagsHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Get tags from storage driver
+	allTags, err := reg.driver.GetTags(r.Context(), repoName)
+	if err != nil {
+		// Assuming driver returns empty list if repo not found, check for other errors
+		reg.log.Printf("Error getting tags for %s: %v", repoName, err)
+		reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to retrieve tags", http.StatusInternalServerError, err)
+		return
+	}
+
+	// Handle pagination
+	q := r.URL.Query()
+	last := q.Get("last")
+	nStr := q.Get("n")
+	limit := 0 // 0 means no limit initially
+
+	if nStr != "" {
+		n, err := strconv.Atoi(nStr)
+		if err != nil || n < 0 {
+			reg.sendError(w, r, distribution.ErrorCodePaginationInvalid, "Invalid 'n' parameter for pagination", http.StatusBadRequest, err)
+			return
+		}
+		limit = n
+	}
+
+	// Filter tags based on 'last'
+	startIndex := 0
+	if last != "" {
+		// Find the index *after* the 'last' tag (lexical comparison)
+		found := false
+		for i, tag := range allTags {
+			if strings.ToLower(tag) > strings.ToLower(last) {
+				startIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			// 'last' was the actual last tag or beyond, return empty list
+			startIndex = len(allTags)
+		}
+	}
+
+	// Apply limit 'n'
+	endIndex := len(allTags)
+	if limit > 0 && startIndex+limit < endIndex {
+		endIndex = startIndex + limit
+	}
+
+	tagsResult := allTags[startIndex:endIndex]
+
+	// Prepare response body
+	respBody := struct {
+		Name string   `json:"name"`
+		Tags []string `json:"tags"`
+	}{
+		Name: repoNameStr,
+		Tags: tagsResult,
+	}
+
+	// Set Link header for pagination if needed (RFC 5988)
+	if limit > 0 && endIndex < len(allTags) {
+		nextLast := tagsResult[len(tagsResult)-1] // The last tag in the current result set
+		linkURL := fmt.Sprintf("/v2/%s/tags/list?n=%d&last=%s", repoName, limit, nextLast)
+		w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"next\"", linkURL))
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(respBody); err != nil {
+		reg.log.Printf("Failed to encode tags response: %v", err)
+	}
+	reg.log.Printf("Handled GET tags request for %s (n=%s, last=%s), returned %d tags", repoName, nStr, last, len(tagsResult))
+}
+
+// TODO: Implement Referrers API handler (GET /v2/{name}/referrers/{digest})
+
 // sendError is a helper to format and send API errors according to the spec.
 func (reg *Registry) sendError(w http.ResponseWriter, r *http.Request, code distribution.ErrorCode, message string, httpStatus int, detail error) {
+	// Add new error code for pagination
+	if code == "" { // Handle cases where a specific code isn't set but status indicates error
+		if httpStatus == http.StatusBadRequest {
+			code = distribution.ErrorCodeUnknown // Or a more specific default?
+		} else {
+			code = distribution.ErrorCodeUnknown
+		}
+	}
+
 	errResp := distribution.NewErrorResponse(distribution.Error{
 		Code:    code.String(), // Convert ErrorCode to string
 		Message: message,

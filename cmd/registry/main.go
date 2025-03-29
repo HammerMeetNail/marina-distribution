@@ -44,7 +44,10 @@ func main() {
 	// Manifest push handler
 	mux.HandleFunc("PUT /v2/{name}/manifests/{reference}", reg.PutManifestHandler)
 
-	// TODO: Add handlers for other endpoints (tags list, delete)
+	// Tag listing handler
+	mux.HandleFunc("GET /v2/{name}/tags/list", reg.GetTagsHandler)
+
+	// TODO: Add handlers for other endpoints (delete, referrers)
 
 	log.Printf("Starting OCI Distribution Registry server on %s", addr)
 

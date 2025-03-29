@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -606,15 +607,32 @@ func (d *Driver) ResolveTag(ctx context.Context, repoName distribution.Repositor
 }
 
 // GetTags lists all tags for a given repository.
-// TODO: Implement this method.
 func (d *Driver) GetTags(ctx context.Context, repoName distribution.RepositoryName) ([]string, error) {
-	// Implementation Note:
-	// 1. Get path using repoTagsPath.
-	// 2. Read directory entries using os.ReadDir.
-	// 3. Collect filenames (which are the tag names).
-	// 4. Sort tags lexically as required by the spec.
-	// 5. Handle errors (os.IsNotExist -> return empty list, no error).
-	return nil, fmt.Errorf("GetTags not yet implemented")
+	tagsPath := d.repoTagsPath(repoName)
+	entries, err := os.ReadDir(tagsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil // No tags directory means no tags, return empty list.
+		}
+		return nil, fmt.Errorf("failed to read tags directory %s: %w", tagsPath, err)
+	}
+
+	tags := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		// Ignore directories or non-regular files within the tags directory
+		if !entry.IsDir() {
+			// TODO: Should we validate that the filename matches the tag regex?
+			tags = append(tags, entry.Name())
+		}
+	}
+
+	// Sort tags lexically (case-insensitive alphanumeric) as required by spec.
+	// Using strings.ToLower for case-insensitivity.
+	sort.Slice(tags, func(i, j int) bool {
+		return strings.ToLower(tags[i]) < strings.ToLower(tags[j])
+	})
+
+	return tags, nil
 }
 
 // TagManifest associates a tag with a manifest digest in a specific repository.
