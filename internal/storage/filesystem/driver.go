@@ -19,8 +19,9 @@ import (
 const (
 	blobDataFolder     = "blobs"
 	uploadDataFolder   = "uploads"
-	manifestDataFolder = "manifests" // Placeholder for future use
-	tagDataFolder      = "tags"      // Placeholder for future use
+	manifestDataFolder = "manifests"
+	repositoryFolder   = "repositories" // Contains tag data per repo
+	tagSubFolder       = "_tags"        // Subfolder within repo for tags
 	tempSuffix         = ".tmp"
 )
 
@@ -40,10 +41,11 @@ func NewDriver(rootDirectory string) (*Driver, error) {
 	// Create necessary subdirectories
 	blobPath := filepath.Join(root, blobDataFolder)
 	uploadPath := filepath.Join(root, uploadDataFolder)
-	// manifestPath := filepath.Join(root, manifestDataFolder) // Future
-	// tagPath := filepath.Join(root, tagDataFolder)          // Future
+	manifestPath := filepath.Join(root, manifestDataFolder)
+	repoPath := filepath.Join(root, repositoryFolder)
 
-	for _, dir := range []string{root, blobPath, uploadPath /*, manifestPath, tagPath*/} {
+	// Ensure all base directories exist
+	for _, dir := range []string{root, blobPath, uploadPath, manifestPath, repoPath} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
@@ -412,6 +414,170 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 	return nil // Success
 }
 
-// --- Manifest & Tag Operations (Stubs) ---
+// --- Manifest Operations ---
 
-// Implementations for Manifest and Tag operations will be added later.
+// manifestPath returns the storage path for a manifest based on its digest.
+// Uses the same sharding logic as blobs.
+func (d *Driver) manifestPath(dgst distribution.Digest) (string, error) {
+	if err := dgst.Validate(); err != nil {
+		return "", fmt.Errorf("invalid digest: %w", err)
+	}
+	parts := strings.SplitN(string(dgst), ":", 2)
+	algo := parts[0]
+	hash := parts[1]
+	if len(hash) < 2 {
+		return "", fmt.Errorf("digest hash too short: %s", hash)
+	}
+	shard := hash[:2]
+	return filepath.Join(d.rootDirectory, manifestDataFolder, algo, shard, hash), nil
+}
+
+// GetManifest retrieves the content of a manifest identified by its digest.
+func (d *Driver) GetManifest(ctx context.Context, dgst distribution.Digest) (io.ReadCloser, error) {
+	path, err := d.manifestPath(dgst)
+	if err != nil {
+		return nil, err // Invalid digest format
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, storage.PathNotFoundError{Path: path}
+		}
+		return nil, fmt.Errorf("failed to open manifest %s: %w", dgst, err)
+	}
+	return file, nil
+}
+
+// PutManifest stores the content read from 'content' as a manifest with the given digest.
+// TODO: Implement verification logic similar to PutContent for blobs.
+func (d *Driver) PutManifest(ctx context.Context, dgst distribution.Digest, content io.Reader) (bytesWritten int64, err error) {
+	// Implementation Note: Very similar to PutContent for blobs.
+	// 1. Get target path using manifestPath.
+	// 2. Create parent dirs.
+	// 3. Write to temp file while calculating digest.
+	// 4. Verify digest.
+	// 5. Rename temp file to final path on success.
+	// 6. Cleanup temp file on failure.
+	return 0, fmt.Errorf("PutManifest not yet implemented")
+}
+
+// StatManifest retrieves information about a manifest identified by its digest.
+func (d *Driver) StatManifest(ctx context.Context, dgst distribution.Digest) (storage.FileInfo, error) {
+	path, err := d.manifestPath(dgst)
+	if err != nil {
+		return storage.FileInfo{}, err // Invalid digest format
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return storage.FileInfo{}, storage.PathNotFoundError{Path: path}
+		}
+		return storage.FileInfo{}, fmt.Errorf("failed to stat manifest %s: %w", dgst, err)
+	}
+
+	if fi.IsDir() {
+		// Manifests should not be directories
+		return storage.FileInfo{}, fmt.Errorf("manifest path is a directory: %s", path)
+	}
+
+	// Note: We assume the file content matches the digest for Stat operations.
+	// Verification happens during PutManifest.
+	return storage.FileInfo{
+		Path:    path, // Or perhaps just the digest? TBD
+		Size:    fi.Size(),
+		ModTime: fi.ModTime(),
+		IsDir:   false,
+		Digest:  dgst, // We assume the file at this path corresponds to the digest
+	}, nil
+}
+
+// DeleteManifest removes a manifest identified by its digest.
+// TODO: Implement this method.
+func (d *Driver) DeleteManifest(ctx context.Context, dgst distribution.Digest) error {
+	// Implementation Note: Similar to Delete for blobs.
+	// 1. Get path using manifestPath.
+	// 2. os.Remove.
+	// 3. Handle errors (PathNotFoundError).
+	return fmt.Errorf("DeleteManifest not yet implemented")
+}
+
+// --- Tag Operations ---
+
+// repoTagsPath returns the path to the directory storing tags for a repository.
+func (d *Driver) repoTagsPath(repoName distribution.RepositoryName) string {
+	// Note: repoName might contain '/', which is fine for subdirectories.
+	// Ensure the repoName is cleaned to prevent path traversal issues, although
+	// validation should handle most cases.
+	cleanRepoName := filepath.Clean(string(repoName))
+	return filepath.Join(d.rootDirectory, repositoryFolder, cleanRepoName, tagSubFolder)
+}
+
+// tagPath returns the path to the file storing the digest for a specific tag.
+func (d *Driver) tagPath(repoName distribution.RepositoryName, tagName string) string {
+	// TODO: Validate tagName format? The spec regex allows '.', '_', '-' but filesystem might have issues?
+	// For now, assume valid tag names are filesystem-safe. Need to ensure tagName is also cleaned.
+	cleanTagName := filepath.Clean(tagName) // Basic cleaning
+	return filepath.Join(d.repoTagsPath(repoName), cleanTagName)
+}
+
+// ResolveTag retrieves the digest associated with a tag in a specific repository.
+func (d *Driver) ResolveTag(ctx context.Context, repoName distribution.RepositoryName, tagName string) (distribution.Digest, error) {
+	path := d.tagPath(repoName, tagName)
+
+	contentBytes, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Use the specific TagNotFoundError
+			return "", storage.TagNotFoundError{Repository: repoName, Tag: tagName}
+		}
+		return "", fmt.Errorf("failed to read tag file %s: %w", path, err)
+	}
+
+	// Content should be just the digest string
+	dgstStr := strings.TrimSpace(string(contentBytes))
+	dgst := distribution.Digest(dgstStr)
+
+	// Validate the digest read from the file
+	if err := dgst.Validate(); err != nil {
+		// This indicates a corrupted tag file
+		return "", fmt.Errorf("invalid digest found in tag file %s: %w", path, err)
+	}
+
+	return dgst, nil
+}
+
+// GetTags lists all tags for a given repository.
+// TODO: Implement this method.
+func (d *Driver) GetTags(ctx context.Context, repoName distribution.RepositoryName) ([]string, error) {
+	// Implementation Note:
+	// 1. Get path using repoTagsPath.
+	// 2. Read directory entries using os.ReadDir.
+	// 3. Collect filenames (which are the tag names).
+	// 4. Sort tags lexically as required by the spec.
+	// 5. Handle errors (os.IsNotExist -> return empty list, no error).
+	return nil, fmt.Errorf("GetTags not yet implemented")
+}
+
+// TagManifest associates a tag with a manifest digest in a specific repository.
+// TODO: Implement this method.
+func (d *Driver) TagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string, dgst distribution.Digest) error {
+	// Implementation Note:
+	// 1. Validate digest.
+	// 2. Get path using tagPath.
+	// 3. Ensure parent directory exists (repoTagsPath).
+	// 4. Write the digest string to the tag file (overwriting if exists). Use temp file + rename for atomicity? Maybe overkill for tags. Direct write might be ok.
+	return fmt.Errorf("TagManifest not yet implemented")
+}
+
+// UntagManifest removes a tag association from a repository.
+// TODO: Implement this method.
+func (d *Driver) UntagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string) error {
+	// Implementation Note:
+	// 1. Get path using tagPath.
+	// 2. Use os.Remove to delete the tag file.
+	// 3. Handle errors (os.IsNotExist -> TagNotFoundError).
+	// 4. Consider cleaning up empty repo tag directories? (Similar to blob/manifest deletion).
+	return fmt.Errorf("UntagManifest not yet implemented")
+}

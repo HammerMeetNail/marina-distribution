@@ -68,14 +68,52 @@ type StorageDriver interface {
 	// 'uploadID' identifies the session, 'finalDigest' is the expected digest of the full blob.
 	FinishUpload(ctx context.Context, uploadID string, finalDigest distribution.Digest) error
 
-	// === Manifest & Tag Operations (Placeholders - To be defined more concretely later) ===
+	// === Manifest Operations ===
+	// Manifests are stored by digest, similar to blobs.
 
-	// GetManifest(ctx context.Context, repoName distribution.RepositoryName, reference distribution.Reference) (distribution.Manifest, error)
-	// PutManifest(ctx context.Context, repoName distribution.RepositoryName, reference distribution.Reference, manifest distribution.Manifest) error
-	// DeleteManifest(ctx context.Context, repoName distribution.RepositoryName, reference distribution.Reference) error
-	// GetTags(ctx context.Context, repoName distribution.RepositoryName) ([]string, error)
-	// TagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string, dgst distribution.Digest) error
-	// UntagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string) error
+	// GetManifest retrieves the content of a manifest identified by its digest.
+	// Returns an io.ReadCloser for the manifest's content.
+	GetManifest(ctx context.Context, dgst distribution.Digest) (io.ReadCloser, error)
+
+	// PutManifest stores the content read from 'content' as a manifest with the given digest.
+	// The content stream is verified against the digest.
+	// Returns the number of bytes written and an error if verification fails or storage fails.
+	PutManifest(ctx context.Context, dgst distribution.Digest, content io.Reader) (bytesWritten int64, err error)
+
+	// StatManifest retrieves information about a manifest identified by its digest.
+	// Returns FileInfo or an error if the manifest doesn't exist.
+	StatManifest(ctx context.Context, dgst distribution.Digest) (FileInfo, error)
+
+	// DeleteManifest removes a manifest identified by its digest.
+	// Returns an error if the manifest doesn't exist or deletion fails.
+	DeleteManifest(ctx context.Context, dgst distribution.Digest) error
+
+	// === Tag Operations ===
+	// Tags map human-readable names to manifest digests within a repository.
+
+	// ResolveTag retrieves the digest associated with a tag in a specific repository.
+	ResolveTag(ctx context.Context, repoName distribution.RepositoryName, tagName string) (distribution.Digest, error)
+
+	// GetTags lists all tags for a given repository.
+	// TODO: Consider pagination support later if needed.
+	GetTags(ctx context.Context, repoName distribution.RepositoryName) ([]string, error)
+
+	// TagManifest associates a tag with a manifest digest in a specific repository.
+	// If the tag already exists, it should be updated.
+	TagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string, dgst distribution.Digest) error
+
+	// UntagManifest removes a tag association from a repository.
+	UntagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string) error
+}
+
+// TagNotFoundError indicates that a tag was not found in the specified repository.
+type TagNotFoundError struct {
+	Repository distribution.RepositoryName
+	Tag        string
+}
+
+func (e TagNotFoundError) Error() string {
+	return fmt.Sprintf("tag %s not found in repository %s", e.Tag, e.Repository)
 }
 
 // PathNotFoundError indicates that a file or directory was not found at the specified path.
