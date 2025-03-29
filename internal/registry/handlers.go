@@ -148,7 +148,8 @@ func (reg *Registry) resolveReferenceToDigest(ctx context.Context, repoName dist
 		// Already a digest, validate it
 		dgst := distribution.Digest(reference)
 		if err := dgst.Validate(); err != nil {
-			return "", fmt.Errorf("%w: %w", distribution.ErrorCodeDigestInvalid, err)
+			// Wrap the sentinel error corresponding to the code
+			return "", fmt.Errorf("%w: %w", distribution.ErrDigestInvalid, err)
 		}
 		return dgst, nil
 	} else if reference.IsTag() {
@@ -156,21 +157,23 @@ func (reg *Registry) resolveReferenceToDigest(ctx context.Context, repoName dist
 		dgst, err := reg.driver.ResolveTag(ctx, repoName, reference.String())
 		if err != nil {
 			if errors.As(err, &storage.TagNotFoundError{}) {
-				return "", fmt.Errorf("%w: %w", distribution.ErrorCodeManifestUnknown, err) // Map storage error to API error
+				// Wrap the sentinel error corresponding to the code
+				return "", fmt.Errorf("%w: %w", distribution.ErrManifestUnknown, err) // Map storage error to API error
 			}
-			// Other storage error
-			return "", fmt.Errorf("%w: failed to resolve tag: %w", distribution.ErrorCodeUnknown, err)
+			// Other storage error - return a standard error, GetManifestHandler will map to ErrorCodeUnknown
+			return "", fmt.Errorf("failed to resolve tag: %w", err)
 		}
 		// Ensure the resolved digest is valid
 		if err := dgst.Validate(); err != nil {
 			// This indicates an internal issue if the driver stored an invalid digest for a tag
 			reg.log.Printf("Error: storage driver resolved tag %s/%s to invalid digest %s: %v", repoName, reference, dgst, err)
-			return "", fmt.Errorf("%w: invalid digest resolved from tag", distribution.ErrorCodeUnknown)
+			// Return a standard error, GetManifestHandler will map to ErrorCodeUnknown
+			return "", fmt.Errorf("invalid digest resolved from tag: %w", err)
 		}
 		return dgst, nil
 	} else {
-		// Invalid reference format
-		return "", fmt.Errorf("%w: invalid reference format", distribution.ErrorCodeManifestInvalid)
+		// Invalid reference format - wrap the sentinel error
+		return "", fmt.Errorf("%w: invalid reference format", distribution.ErrManifestInvalid)
 	}
 }
 
