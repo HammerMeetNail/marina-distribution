@@ -552,13 +552,22 @@ func (d *Driver) StatManifest(ctx context.Context, dgst distribution.Digest) (st
 }
 
 // DeleteManifest removes a manifest identified by its digest.
-// TODO: Implement this method.
 func (d *Driver) DeleteManifest(ctx context.Context, dgst distribution.Digest) error {
-	// Implementation Note: Similar to Delete for blobs.
-	// 1. Get path using manifestPath.
-	// 2. os.Remove.
-	// 3. Handle errors (PathNotFoundError).
-	return fmt.Errorf("DeleteManifest not yet implemented")
+	path, err := d.manifestPath(dgst)
+	if err != nil {
+		return err // Invalid digest format
+	}
+
+	err = os.Remove(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return storage.PathNotFoundError{Path: path}
+		}
+		return fmt.Errorf("failed to delete manifest %s: %w", dgst, err)
+	}
+
+	// Optional: Clean up empty parent directories. Skipped for now.
+	return nil
 }
 
 // --- Tag Operations ---
@@ -664,12 +673,18 @@ func (d *Driver) TagManifest(ctx context.Context, repoName distribution.Reposito
 }
 
 // UntagManifest removes a tag association from a repository.
-// TODO: Implement this method.
 func (d *Driver) UntagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string) error {
-	// Implementation Note:
-	// 1. Get path using tagPath.
-	// 2. Use os.Remove to delete the tag file.
-	// 3. Handle errors (os.IsNotExist -> TagNotFoundError).
-	// 4. Consider cleaning up empty repo tag directories? (Similar to blob/manifest deletion).
-	return fmt.Errorf("UntagManifest not yet implemented")
+	path := d.tagPath(repoName, tagName)
+
+	err := os.Remove(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// If the tag file doesn't exist, return the specific TagNotFoundError
+			return storage.TagNotFoundError{Repository: repoName, Tag: tagName}
+		}
+		return fmt.Errorf("failed to delete tag file %s: %w", path, err)
+	}
+
+	// Optional: Clean up empty parent directories (repoTagsPath). Skipped for now.
+	return nil
 }

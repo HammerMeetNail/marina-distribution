@@ -712,6 +712,115 @@ func (reg *Registry) GetTagsHandler(w http.ResponseWriter, r *http.Request) {
 
 // TODO: Implement Referrers API handler (GET /v2/{name}/referrers/{digest})
 
+// --- Delete Handlers ---
+
+// DeleteManifestHandler handles deleting manifests or tags.
+// Pattern: DELETE /v2/{name}/manifests/{reference}
+func (reg *Registry) DeleteManifestHandler(w http.ResponseWriter, r *http.Request) {
+	// TODO: Check if deletion is enabled in registry config. Return 405 if disabled.
+
+	repoNameStr := r.PathValue("name")
+	referenceStr := r.PathValue("reference")
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	reference := distribution.Reference(referenceStr)
+	if err := reference.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeManifestInvalid, "Invalid reference format", http.StatusBadRequest, err)
+		return
+	}
+
+	var err error
+	if reference.IsTag() {
+		// Delete the tag
+		tagName := reference.String()
+		err = reg.driver.UntagManifest(r.Context(), repoName, tagName)
+		if err != nil {
+			if errors.As(err, &storage.TagNotFoundError{}) {
+				reg.sendError(w, r, distribution.ErrorCodeManifestUnknown, "Tag not found", http.StatusNotFound, err)
+			} else {
+				reg.log.Printf("Error untagging %s/%s: %v", repoName, tagName, err)
+				reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to delete tag", http.StatusInternalServerError, err)
+			}
+			return
+		}
+		reg.log.Printf("Deleted tag %s/%s", repoName, tagName)
+	} else if reference.IsDigest() {
+		// Delete the manifest by digest
+		dgst := distribution.Digest(reference)
+		// We already validated the format, but validate again for safety/consistency
+		if errVal := dgst.Validate(); errVal != nil {
+			reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Invalid digest format", http.StatusBadRequest, errVal)
+			return
+		}
+
+		// TODO: Implement Referrers API fallback logic if needed (see spec).
+		// If deleting a manifest with a subject field and referrers API is not supported,
+		// the client *should* update the referrers tag schema. This handler might
+		// need to coordinate or simply allow the delete. For now, just delete.
+
+		err = reg.driver.DeleteManifest(r.Context(), dgst)
+		if err != nil {
+			if errors.As(err, &storage.PathNotFoundError{}) {
+				reg.sendError(w, r, distribution.ErrorCodeManifestUnknown, "Manifest not found", http.StatusNotFound, err)
+			} else {
+				reg.log.Printf("Error deleting manifest %s in %s: %v", dgst, repoName, err)
+				reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to delete manifest", http.StatusInternalServerError, err)
+			}
+			return
+		}
+		reg.log.Printf("Deleted manifest %s/%s", repoName, dgst)
+	} else {
+		// This case should be caught by reference.Validate() above, but handle defensively.
+		reg.sendError(w, r, distribution.ErrorCodeManifestInvalid, "Invalid reference format", http.StatusBadRequest, nil)
+		return
+	}
+
+	// Success
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted
+}
+
+// DeleteBlobHandler handles deleting blobs.
+// Pattern: DELETE /v2/{name}/blobs/{digest}
+func (reg *Registry) DeleteBlobHandler(w http.ResponseWriter, r *http.Request) {
+	// TODO: Check if deletion is enabled in registry config. Return 405 if disabled.
+
+	repoNameStr := r.PathValue("name")
+	digestStr := r.PathValue("digest")
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	dgst := distribution.Digest(digestStr)
+	if err := dgst.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Invalid digest format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Call storage driver to delete the blob
+	err := reg.driver.Delete(r.Context(), dgst)
+	if err != nil {
+		if errors.As(err, &storage.PathNotFoundError{}) {
+			reg.sendError(w, r, distribution.ErrorCodeBlobUnknown, "Blob not found", http.StatusNotFound, err)
+		} else {
+			reg.log.Printf("Error deleting blob %s in %s: %v", dgst, repoName, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to delete blob", http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	// Success
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted
+	reg.log.Printf("Deleted blob %s/%s", repoName, dgst)
+}
+
 // sendError is a helper to format and send API errors according to the spec.
 func (reg *Registry) sendError(w http.ResponseWriter, r *http.Request, code distribution.ErrorCode, message string, httpStatus int, detail error) {
 	// Add new error code for pagination

@@ -47,7 +47,11 @@ func main() {
 	// Tag listing handler
 	mux.HandleFunc("GET /v2/{name}/tags/list", reg.GetTagsHandler)
 
-	// TODO: Add handlers for other endpoints (delete, referrers)
+	// Delete handlers
+	mux.HandleFunc("DELETE /v2/{name}/manifests/{reference}", reg.DeleteManifestHandler)
+	mux.HandleFunc("DELETE /v2/{name}/blobs/{digest}", reg.DeleteBlobHandler)
+
+	// TODO: Add handlers for other endpoints (referrers)
 
 	log.Printf("Starting OCI Distribution Registry server on %s", addr)
 
