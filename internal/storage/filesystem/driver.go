@@ -450,16 +450,73 @@ func (d *Driver) GetManifest(ctx context.Context, dgst distribution.Digest) (io.
 }
 
 // PutManifest stores the content read from 'content' as a manifest with the given digest.
-// TODO: Implement verification logic similar to PutContent for blobs.
 func (d *Driver) PutManifest(ctx context.Context, dgst distribution.Digest, content io.Reader) (bytesWritten int64, err error) {
-	// Implementation Note: Very similar to PutContent for blobs.
-	// 1. Get target path using manifestPath.
-	// 2. Create parent dirs.
-	// 3. Write to temp file while calculating digest.
-	// 4. Verify digest.
-	// 5. Rename temp file to final path on success.
-	// 6. Cleanup temp file on failure.
-	return 0, fmt.Errorf("PutManifest not yet implemented")
+	targetPath, err := d.manifestPath(dgst)
+	if err != nil {
+		return 0, err // Invalid digest format
+	}
+
+	// Ensure parent directory exists
+	targetDir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return 0, fmt.Errorf("failed to create manifest directory %s: %w", targetDir, err)
+	}
+
+	// Create a temporary file
+	tempFile, err := os.CreateTemp(targetDir, filepath.Base(targetPath)+tempSuffix)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temporary file for manifest %s: %w", dgst, err)
+	}
+	defer func() {
+		tempFile.Close()
+		if err != nil { // If an error occurred during the process, remove the temp file
+			if removeErr := os.Remove(tempFile.Name()); removeErr != nil && !os.IsNotExist(removeErr) {
+				fmt.Fprintf(os.Stderr, "warning: failed to remove temporary manifest file %s: %v\n", tempFile.Name(), removeErr)
+			}
+		}
+	}()
+
+	// Get hash function based on digest algorithm
+	hashFunc, err := distribution.GetHashFunc(dgst.Algorithm())
+	if err != nil {
+		return 0, fmt.Errorf("unsupported digest algorithm %s: %w", dgst.Algorithm(), err)
+	}
+	hasher := hashFunc.New()
+
+	// Tee reader to write and hash simultaneously
+	teeReader := io.TeeReader(content, hasher)
+
+	// Copy data to temp file
+	bytesWritten, err = io.Copy(tempFile, teeReader)
+	if err != nil {
+		return bytesWritten, fmt.Errorf("failed to write manifest content to temporary file %s: %w", tempFile.Name(), err)
+	}
+
+	// Verify calculated digest
+	calculatedDigest := distribution.NewDigest(dgst.Algorithm(), hasher)
+	if calculatedDigest != dgst {
+		err = storage.DigestMismatchError{Provided: dgst, Actual: calculatedDigest}
+		return bytesWritten, err // Temp file removed by defer
+	}
+
+	// Close temp file before rename
+	if err = tempFile.Close(); err != nil {
+		err = fmt.Errorf("failed to close temporary manifest file %s before rename: %w", tempFile.Name(), err)
+		return bytesWritten, err
+	}
+
+	// Rename temp file to final path
+	if err = os.Rename(tempFile.Name(), targetPath); err != nil {
+		// Attempt cleanup if rename fails
+		if removeErr := os.Remove(tempFile.Name()); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Fprintf(os.Stderr, "warning: failed to remove temporary manifest file %s after failed rename: %v\n", tempFile.Name(), removeErr)
+		}
+		err = fmt.Errorf("failed to rename temporary manifest file %s to final path %s: %w", tempFile.Name(), targetPath, err)
+		return bytesWritten, err
+	}
+
+	// Success
+	return bytesWritten, nil
 }
 
 // StatManifest retrieves information about a manifest identified by its digest.
@@ -561,14 +618,31 @@ func (d *Driver) GetTags(ctx context.Context, repoName distribution.RepositoryNa
 }
 
 // TagManifest associates a tag with a manifest digest in a specific repository.
-// TODO: Implement this method.
 func (d *Driver) TagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string, dgst distribution.Digest) error {
-	// Implementation Note:
-	// 1. Validate digest.
-	// 2. Get path using tagPath.
-	// 3. Ensure parent directory exists (repoTagsPath).
-	// 4. Write the digest string to the tag file (overwriting if exists). Use temp file + rename for atomicity? Maybe overkill for tags. Direct write might be ok.
-	return fmt.Errorf("TagManifest not yet implemented")
+	if err := dgst.Validate(); err != nil {
+		return fmt.Errorf("invalid digest provided for tagging: %w", err)
+	}
+
+	// TODO: Validate tagName format strictly?
+
+	tagFilePath := d.tagPath(repoName, tagName)
+	tagDirPath := filepath.Dir(tagFilePath)
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(tagDirPath, 0755); err != nil {
+		return fmt.Errorf("failed to create tag directory %s: %w", tagDirPath, err)
+	}
+
+	// Write the digest string to the tag file.
+	// Using WriteFile is simple and sufficient for tags, as concurrent writes
+	// to the same tag should just result in the last write winning, which is acceptable.
+	// A temp file + rename would provide more atomicity if needed.
+	err := os.WriteFile(tagFilePath, []byte(dgst.String()), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write tag file %s: %w", tagFilePath, err)
+	}
+
+	return nil
 }
 
 // UntagManifest removes a tag association from a repository.

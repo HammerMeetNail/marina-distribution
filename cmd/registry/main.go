@@ -36,7 +36,15 @@ func main() {
 	mux.HandleFunc("GET /v2/{name}/manifests/{reference}", reg.GetManifestHandler)
 	mux.HandleFunc("HEAD /v2/{name}/manifests/{reference}", reg.HeadManifestHandler)
 
-	// TODO: Add handlers for other endpoints (tags, uploads, delete)
+	// Blob Upload handlers
+	mux.HandleFunc("POST /v2/{name}/blobs/uploads/", reg.StartBlobUploadHandler)
+	mux.HandleFunc("PATCH /v2/{name}/blobs/uploads/{uuid}", reg.PatchBlobUploadHandler)
+	mux.HandleFunc("PUT /v2/{name}/blobs/uploads/{uuid}", reg.PutBlobUploadHandler) // Note: Query params handled in handler
+
+	// Manifest push handler
+	mux.HandleFunc("PUT /v2/{name}/manifests/{reference}", reg.PutManifestHandler)
+
+	// TODO: Add handlers for other endpoints (tags list, delete)
 
 	log.Printf("Starting OCI Distribution Registry server on %s", addr)
 

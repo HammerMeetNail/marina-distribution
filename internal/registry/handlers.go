@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"   // Add bytes import
 	"context" // Add context import
 	"encoding/json"
 	"errors"
@@ -316,6 +317,310 @@ func (reg *Registry) HeadManifestHandler(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("ETag", dgst.String())
 	w.WriteHeader(http.StatusOK) // Success
 	reg.log.Printf("Handled HEAD manifest request for %s/%s (resolved to %s)", repoName, reference, dgst)
+}
+
+// PutManifestHandler handles manifest uploads.
+// Pattern: PUT /v2/{name}/manifests/{reference}
+func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	referenceStr := r.PathValue("reference")
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	reference := distribution.Reference(referenceStr)
+	// Basic validation of reference format (tag or digest)
+	if err := reference.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeManifestInvalid, "Invalid reference format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Read the manifest body
+	manifestBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		reg.log.Printf("Error reading manifest body for %s/%s: %v", repoName, reference, err)
+		reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to read manifest body", http.StatusInternalServerError, err)
+		return
+	}
+	_ = int64(len(manifestBytes)) // Assign to blank identifier to silence unused error for now
+
+	// TODO: Enforce manifest size limit (e.g., 4MB) - return 413 Payload Too Large
+	// if contentLength > 4*1024*1024 { ... }
+
+	// Validate Content-Type header
+	contentType := r.Header.Get("Content-Type")
+	// TODO: More robust media type parsing/validation might be needed.
+	// The spec says clients MUST set Content-Type to the manifest's mediaType if present.
+	// We should ideally parse the manifest here to verify this, but that adds complexity.
+	// For now, we'll just check if it's provided.
+	if contentType == "" {
+		reg.sendError(w, r, distribution.ErrorCodeManifestInvalid, "Missing Content-Type header", http.StatusBadRequest, nil)
+		return
+	}
+
+	// Calculate the digest of the received manifest body.
+	// We need a default algorithm if the reference is a tag. SHA256 is standard.
+	// If the reference *is* a digest, we should use its algorithm.
+	var expectedDigest distribution.Digest
+	var algo = distribution.SHA256 // Default algorithm
+	isDigestReference := reference.IsDigest()
+
+	if isDigestReference {
+		expectedDigest = distribution.Digest(reference)
+		algo = expectedDigest.Algorithm() // Use algorithm from the reference digest
+		if !algo.Available() {
+			reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Unsupported digest algorithm in reference", http.StatusBadRequest, fmt.Errorf("unsupported algorithm: %s", algo))
+			return
+		}
+	}
+
+	hashFunc, err := distribution.GetHashFunc(algo)
+	if err != nil {
+		// Should not happen if algo.Available() passed or default was used
+		reg.log.Printf("Internal error getting hash function for %s: %v", algo, err)
+		reg.sendError(w, r, distribution.ErrorCodeUnknown, "Internal server error", http.StatusInternalServerError, err)
+		return
+	}
+	hasher := hashFunc.New()
+	hasher.Write(manifestBytes) // Hash the manifest content
+	calculatedDigest := distribution.NewDigest(algo, hasher)
+
+	// If the reference was a digest, verify it matches the calculated digest
+	if isDigestReference && expectedDigest != calculatedDigest {
+		err := fmt.Errorf("provided digest %s does not match calculated content digest %s", expectedDigest, calculatedDigest)
+		reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, err.Error(), http.StatusBadRequest, err)
+		return
+	}
+
+	// TODO: Validate manifest content itself (JSON structure, required fields, referenced blob existence)
+	// This requires unmarshalling the manifestBytes and checking against OCI Image Spec.
+	// If validation fails, return MANIFEST_INVALID or MANIFEST_BLOB_UNKNOWN.
+
+	// Store the manifest using the calculated digest
+	_, err = reg.driver.PutManifest(r.Context(), calculatedDigest, bytes.NewReader(manifestBytes)) // Use bytes.NewReader
+	if err != nil {
+		// Handle potential DigestMismatchError from storage (shouldn't happen here ideally)
+		if errors.As(err, &storage.DigestMismatchError{}) {
+			reg.log.Printf("Internal Error: Digest mismatch during PutManifest for %s: %v", calculatedDigest, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Internal storage error during manifest put", http.StatusInternalServerError, err)
+		} else {
+			reg.log.Printf("Error putting manifest %s for %s/%s: %v", calculatedDigest, repoName, reference, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to store manifest", http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	// If the reference was a tag, associate the tag with the calculated digest
+	if reference.IsTag() {
+		tagName := reference.String()
+		err = reg.driver.TagManifest(r.Context(), repoName, tagName, calculatedDigest)
+		if err != nil {
+			// Log the error, but the manifest PUT itself was successful.
+			// What's the correct response? The spec isn't explicit.
+			// Let's still return 201 Created but log the tagging error.
+			reg.log.Printf("Error tagging manifest %s with tag %s for %s: %v", calculatedDigest, tagName, repoName, err)
+			// Consider if a different response/error is more appropriate.
+		}
+	}
+
+	// TODO: Handle 'subject' field and OCI-Subject header for Referrers API support.
+
+	// Success!
+	manifestLocation := fmt.Sprintf("/v2/%s/manifests/%s", repoName, calculatedDigest)
+	w.Header().Set("Location", manifestLocation)
+	w.Header().Set("Docker-Content-Digest", calculatedDigest.String())
+	w.WriteHeader(http.StatusCreated) // 201 Created
+
+	reg.log.Printf("Stored manifest for %s/%s with digest %s", repoName, reference, calculatedDigest)
+}
+
+// --- Upload Handlers ---
+
+// StartBlobUploadHandler initiates a new blob upload.
+// Pattern: POST /v2/{name}/blobs/uploads/
+func (reg *Registry) StartBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// TODO: Handle monolithic blob push via single POST request (?digest=<digest>)
+	// TODO: Handle cross-repository blob mount (?mount=<digest>&from=<other_name>)
+
+	// Initiate upload session with the storage driver
+	uploadID, err := reg.driver.StartUpload(r.Context(), repoName)
+	if err != nil {
+		reg.log.Printf("Error starting blob upload for %s: %v", repoName, err)
+		reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to start blob upload", http.StatusInternalServerError, err)
+		return
+	}
+
+	// Construct the upload URL. It should be relative to the registry base.
+	// The spec allows absolute or relative URLs. Relative is often simpler.
+	// The <reference> in the PATCH/PUT URL will be this uploadID.
+	uploadURL := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repoName, uploadID)
+
+	w.Header().Set("Location", uploadURL)
+	w.Header().Set("Range", "0-0") // Initial range for chunked upload
+	// OCI-Chunk-Min-Length header could be set here if the driver provides it.
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted
+
+	reg.log.Printf("Started blob upload for %s, upload ID: %s, location: %s", repoName, uploadID, uploadURL)
+}
+
+// PatchBlobUploadHandler handles chunked blob uploads.
+// Pattern: PATCH /v2/{name}/blobs/uploads/{uuid}
+func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	uploadID := r.PathValue("uuid") // Assuming the path param is named 'uuid'
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Validate Content-Type
+	contentType := r.Header.Get("Content-Type")
+	if contentType != "application/octet-stream" {
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Type, expected application/octet-stream", http.StatusBadRequest, nil)
+		return
+	}
+
+	// Parse Content-Range header (e.g., "0-999")
+	contentRange := r.Header.Get("Content-Range")
+	var startOffset, endOffset int64
+	if contentRange != "" {
+		// Note: The spec says range MUST be inclusive, e.g., 0-999 for 1000 bytes.
+		// fmt.Sscanf is simple but might be too lenient. A regex might be better.
+		_, err := fmt.Sscanf(contentRange, "%d-%d", &startOffset, &endOffset)
+		if err != nil || startOffset < 0 || endOffset < startOffset {
+			reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header format", http.StatusRequestedRangeNotSatisfiable, err)
+			return
+		}
+	} else {
+		// Content-Range is required for PATCH according to spec? Let's assume yes for now.
+		// If not provided, maybe try to infer from Content-Length if offset is 0? Risky.
+		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Missing Content-Range header", http.StatusBadRequest, nil)
+		return
+	}
+
+	// Validate Content-Length (size of the chunk being sent)
+	contentLengthStr := r.Header.Get("Content-Length")
+	chunkSize, err := strconv.ParseInt(contentLengthStr, 10, 64)
+	if err != nil || chunkSize < 0 {
+		reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Invalid or missing Content-Length header", http.StatusBadRequest, err)
+		return
+	}
+
+	// Check if chunk size matches the range
+	expectedChunkSize := endOffset - startOffset + 1
+	if chunkSize != expectedChunkSize {
+		reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Content-Length does not match Content-Range", http.StatusBadRequest, fmt.Errorf("range %d-%d implies size %d, but Content-Length is %d", startOffset, endOffset, expectedChunkSize, chunkSize))
+		return
+	}
+
+	// Call storage driver to put the chunk
+	bytesWritten, err := reg.driver.PutUploadChunk(r.Context(), uploadID, startOffset, r.Body)
+	// Note: r.Body is automatically closed by the http server
+
+	if err != nil {
+		if errors.As(err, &storage.UploadNotFoundError{}) {
+			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
+		} else if errors.As(err, &storage.InvalidOffsetError{}) {
+			// If offset is wrong, return 416 Range Not Satisfiable
+			// Get current progress to inform client
+			currentOffset, progressErr := reg.driver.GetUploadProgress(r.Context(), uploadID)
+			if progressErr != nil {
+				reg.log.Printf("Error getting upload progress for %s after invalid offset: %v", uploadID, progressErr)
+				// Fallback to generic error if we can't get progress
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid upload offset", http.StatusRequestedRangeNotSatisfiable, err)
+			} else {
+				uploadURL := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repoName, uploadID)
+				w.Header().Set("Location", uploadURL)
+				w.Header().Set("Range", fmt.Sprintf("0-%d", currentOffset-1)) // Range is inclusive
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)        // 416
+				reg.log.Printf("Invalid offset for upload %s. Expected %d, got %d.", uploadID, currentOffset, startOffset)
+			}
+		} else {
+			reg.log.Printf("Error putting upload chunk for %s: %v", uploadID, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to write upload chunk", http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	// Success
+	newEndOffset := startOffset + bytesWritten - 1 // Calculate the actual end offset based on bytes written
+	uploadURL := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repoName, uploadID)
+	w.Header().Set("Location", uploadURL)
+	w.Header().Set("Range", fmt.Sprintf("0-%d", newEndOffset)) // Range is inclusive, 0-based
+	w.WriteHeader(http.StatusAccepted)                         // 202 Accepted
+
+	reg.log.Printf("Handled PATCH blob upload chunk for %s/%s, range %d-%d, bytes written: %d", repoName, uploadID, startOffset, endOffset, bytesWritten)
+}
+
+// PutBlobUploadHandler finalizes a blob upload (chunked or monolithic POST/PUT).
+// Pattern: PUT /v2/{name}/blobs/uploads/{uuid}?digest={digest}
+func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	uploadID := r.PathValue("uuid")
+	digestStr := r.URL.Query().Get("digest")
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Validate the final digest provided in the query parameter
+	finalDigest := distribution.Digest(digestStr)
+	if err := finalDigest.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Invalid digest query parameter", http.StatusBadRequest, err)
+		return
+	}
+
+	// Note: The spec allows the final chunk to be sent with this PUT request.
+	// The current filesystem driver's FinishUpload expects the data file to be complete.
+	// Handling an optional body here adds complexity (need to append chunk then finish).
+	// For now, assume the final chunk was sent via PATCH or it was a monolithic POST/PUT.
+	// If r.ContentLength > 0, we might need to handle that final chunk here.
+	if r.ContentLength > 0 {
+		// TODO: Handle final chunk upload if necessary. This might involve:
+		// 1. Getting current upload progress.
+		// 2. Parsing Content-Range if present (optional for final PUT chunk?).
+		// 3. Calling PutUploadChunk with r.Body.
+		// 4. Proceeding to FinishUpload only if PutUploadChunk succeeds.
+		reg.sendError(w, r, distribution.ErrorCodeUnsupported, "Uploading final chunk via PUT is not yet supported", http.StatusNotImplemented, nil)
+		reg.log.Printf("Received PUT request with body for upload %s - final chunk via PUT not implemented", uploadID)
+		return
+	}
+
+	// Call storage driver to finalize the upload
+	err := reg.driver.FinishUpload(r.Context(), uploadID, finalDigest)
+	if err != nil {
+		if errors.As(err, &storage.UploadNotFoundError{}) {
+			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
+		} else if errors.As(err, &storage.DigestMismatchError{}) {
+			reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Provided digest did not match uploaded content", http.StatusBadRequest, err)
+		} else {
+			reg.log.Printf("Error finishing upload %s with digest %s: %v", uploadID, finalDigest, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to finalize blob upload", http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	// Success! Respond with 201 Created and the location of the blob.
+	blobLocation := fmt.Sprintf("/v2/%s/blobs/%s", repoName, finalDigest)
+	w.Header().Set("Location", blobLocation)
+	w.Header().Set("Docker-Content-Digest", finalDigest.String())
+	w.WriteHeader(http.StatusCreated) // 201 Created
+
+	reg.log.Printf("Finished blob upload for %s/%s, final digest: %s", repoName, uploadID, finalDigest)
 }
 
 // sendError is a helper to format and send API errors according to the spec.
