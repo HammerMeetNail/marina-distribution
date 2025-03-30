@@ -517,6 +517,7 @@ func (d *Driver) PutManifest(ctx context.Context, dgst distribution.Digest, cont
 	}
 
 	// Success
+	fmt.Fprintf(os.Stderr, "[PutManifest] Successfully stored: %s\n", targetPath) // Added log
 	return bytesWritten, nil
 }
 
@@ -687,4 +688,89 @@ func (d *Driver) UntagManifest(ctx context.Context, repoName distribution.Reposi
 
 	// Optional: Clean up empty parent directories (repoTagsPath). Skipped for now.
 	return nil
+}
+
+// ListManifestDigests retrieves a list of all manifest digests stored globally.
+// Note: The current filesystem layout stores manifests globally by digest, not per-repository.
+// The repoName parameter is included for interface compatibility but is not used in this implementation
+// to filter the results. A different storage layout would be needed for per-repo manifest listing.
+func (d *Driver) ListManifestDigests(ctx context.Context, repoName distribution.RepositoryName) ([]distribution.Digest, error) {
+	manifestRoot := filepath.Join(d.rootDirectory, manifestDataFolder)
+	var digests []distribution.Digest
+	fmt.Fprintf(os.Stderr, "[ListManifestDigests] Walking root: %s\n", manifestRoot)
+
+	err := filepath.WalkDir(manifestRoot, func(path string, entry os.DirEntry, err error) error {
+		entryName := "<nil>"
+		isDir := false
+		if entry != nil {
+			entryName = entry.Name()
+			isDir = entry.IsDir()
+		}
+		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Visiting Path: %s, EntryName: %s, IsDir: %t, Error: %v\n", path, entryName, isDir, err) // More detailed log
+
+		if err != nil {
+			// Log the error but return filepath.SkipDir for the problematic path to allow walking other parts.
+			// If the root itself fails, WalkDir will return the error anyway.
+			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Error accessing %s: %v. Skipping subtree.\n", path, err) // Modified log
+			if os.IsNotExist(err) {
+				return nil // If it doesn't exist, just continue (might be a deleted dir or transient error)
+			}
+			// For permission errors etc., skip the specific directory/file and its contents
+			if entry != nil && entry.IsDir() {
+				return filepath.SkipDir // Skip the directory if we can't access it
+			}
+			return nil // Skip the file if we can't access it
+		}
+
+		// Only process files. Allow WalkDir to descend into directories.
+		if entry.IsDir() {
+			// fmt.Fprintf(os.Stderr, "[ListManifestDigests] Entering directory: %s\n", path) // Optional: Log entering dirs
+			return nil // Continue walking into the directory
+		}
+
+		// Now we know it's a file, process it
+		// We expect files at depth: manifestRoot/{algo}/{shard}/{hash}
+		// Calculate relative path to determine algo and hash
+		relPath, err := filepath.Rel(manifestRoot, path)
+		if err != nil {
+			// Should not happen if path is within manifestRoot
+			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: could not get relative path for manifest %s: %v\n", path, err)
+			return nil // Skip this file
+		}
+		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Processing file: %s (Relative: %s)\n", path, relPath) // Added log
+
+		parts := strings.Split(relPath, string(filepath.Separator))
+		// Expected structure: [algo, shard, hash]
+		if len(parts) != 3 {
+			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: unexpected manifest file structure at %s (parts: %d), skipping\n", path, len(parts)) // Added log
+			return nil                                                                                                                                  // Skip files not matching the expected structure
+		}
+
+		algo := parts[0]
+		hash := parts[2] // The filename is the hash
+
+		// Construct and validate the digest
+		dgstStr := algo + ":" + hash
+		dgst := distribution.Digest(dgstStr)
+		if err := dgst.Validate(); err != nil {
+			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: invalid digest format derived from path %s (%s), skipping: %v\n", path, dgstStr, err) // Added log
+			return nil                                                                                                                                   // Skip invalid digests
+		}
+
+		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Found valid digest: %s\n", dgstStr) // Added log
+		digests = append(digests, dgst)
+		return nil
+	})
+
+	if err != nil {
+		// Handle potential error from WalkDir itself (not errors processed within the walk func)
+		// Check if the root manifest directory doesn't exist, which is not an error, just means no manifests.
+		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Error during WalkDir: %v\n", err) // Added log
+		if _, statErr := os.Stat(manifestRoot); os.IsNotExist(statErr) {
+			return []distribution.Digest{}, nil // Return empty list if root doesn't exist
+		}
+		return nil, fmt.Errorf("error walking manifest directory %s: %w", manifestRoot, err)
+	}
+
+	return digests, nil
 }

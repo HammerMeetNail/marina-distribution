@@ -430,7 +430,26 @@ func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// TODO: Handle 'subject' field and OCI-Subject header for Referrers API support.
+	// Handle 'subject' field and OCI-Subject header for Referrers API support.
+	var manifest struct {
+		Subject *distribution.Descriptor `json:"subject,omitempty"`
+		// Include other fields if needed for validation, but subject is key here
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err == nil { // Attempt to unmarshal
+		if manifest.Subject != nil {
+			subjectDigest := distribution.Digest(manifest.Subject.Digest) // Convert to our Digest type
+			if err := subjectDigest.Validate(); err == nil {              // Validate the subject digest
+				w.Header().Set("OCI-Subject", subjectDigest.String())
+				reg.log.Printf("Set OCI-Subject header to %s for manifest %s", subjectDigest, calculatedDigest)
+			} else {
+				// Log if subject digest is invalid, but don't fail the request (spec doesn't mandate failure here)
+				reg.log.Printf("Manifest %s contained subject with invalid digest: %s, error: %v", calculatedDigest, manifest.Subject.Digest, err)
+			}
+		}
+	} else {
+		// Log if unmarshalling fails, but don't fail the request as manifest storage succeeded
+		reg.log.Printf("Could not unmarshal manifest %s to check for subject: %v", calculatedDigest, err)
+	}
 
 	// Success!
 	manifestLocation := fmt.Sprintf("/v2/%s/manifests/%s", repoName, calculatedDigest)
@@ -814,7 +833,65 @@ func (reg *Registry) GetTagsHandler(w http.ResponseWriter, r *http.Request) {
 	reg.log.Printf("Handled GET tags request for %s (n=%s, last=%s), returned %d tags", repoName, nStr, last, len(tagsResult))
 }
 
-// TODO: Implement Referrers API handler (GET /v2/{name}/referrers/{digest})
+// --- Referrers Handler ---
+
+// GetReferrersHandler handles listing manifests that refer to a subject digest.
+// Pattern: GET /v2/{name}/referrers/{digest}?artifactType={type}
+func (reg *Registry) GetReferrersHandler(w http.ResponseWriter, r *http.Request) {
+	repoNameStr := r.PathValue("name")
+	subjectDigestStr := r.PathValue("digest")
+	artifactTypeFilter := r.URL.Query().Get("artifactType") // Optional filter
+
+	reg.log.Printf("Received GET referrers request for %s/%s (filter: %s)", repoNameStr, subjectDigestStr, artifactTypeFilter)
+
+	// 1. Parse and validate repository name
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// 2. Parse and validate subject digest
+	subjectDigest := distribution.Digest(subjectDigestStr)
+	if err := subjectDigest.Validate(); err != nil {
+		// Spec: "If the request is invalid, such as a <digest> with an invalid syntax, a 400 Bad Request MUST be returned."
+		reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Invalid subject digest format", http.StatusBadRequest, err)
+		return
+	}
+
+	// 3. Call core registry logic
+	index, filteringApplied, err := reg.GetReferrers(r.Context(), repoName, subjectDigest, artifactTypeFilter)
+	if err != nil {
+		// Handle potential errors from the core logic.
+		// TODO: Refine error handling based on specific errors returned by GetReferrers if needed.
+		// For now, assume internal errors. The spec says NOT to return 404 unless repo is unknown,
+		// but our current storage doesn't check repo existence for ListManifestDigests.
+		reg.log.Printf("Error calling GetReferrers for %s/%s: %v", repoName, subjectDigest, err)
+		reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to retrieve referrers", http.StatusInternalServerError, err)
+		return
+	}
+
+	// 4. Handle successful response (even if index.Manifests is empty)
+	// Set Content-Type
+	w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+
+	// Set OCI-Filters-Applied header if filtering occurred
+	if filteringApplied {
+		w.Header().Set("OCI-Filters-Applied", "artifactType")
+		reg.log.Printf("Applied artifactType filter for %s/%s", repoName, subjectDigest)
+	}
+
+	// TODO: Handle pagination Link header if GetReferrers supports it in the future.
+
+	// Marshal and send response
+	w.WriteHeader(http.StatusOK) // 200 OK
+	if err := json.NewEncoder(w).Encode(index); err != nil {
+		// Hard to send a different error now, just log it.
+		reg.log.Printf("Failed to encode referrers response for %s/%s: %v", repoName, subjectDigest, err)
+	}
+
+	reg.log.Printf("Successfully handled GET referrers request for %s/%s, returned %d descriptors", repoName, subjectDigest, len(index.Manifests))
+}
 
 // --- Delete Handlers ---
 

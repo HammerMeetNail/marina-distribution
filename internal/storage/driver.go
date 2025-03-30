@@ -88,6 +88,10 @@ type StorageDriver interface {
 	// Returns an error if the manifest doesn't exist or deletion fails.
 	DeleteManifest(ctx context.Context, dgst distribution.Digest) error
 
+	// ListManifestDigests retrieves a list of all manifest digests stored within a repository.
+	// This is needed for operations like scanning for referrers.
+	ListManifestDigests(ctx context.Context, repoName distribution.RepositoryName) ([]distribution.Digest, error)
+
 	// === Tag Operations ===
 	// Tags map human-readable names to manifest digests within a repository.
 
