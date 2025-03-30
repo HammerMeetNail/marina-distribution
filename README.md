@@ -100,7 +100,7 @@ You can build and run this registry as a container using Podman (or Docker).
 
 The OCI Distribution Conformance tests can be run against this registry implementation using the provided script.
 
-1.  **Prerequisites:** Ensure you have the `conformance.test` binary (from the [distribution-spec conformance suite](https://github.com/opencontainers/distribution-spec/tree/main/conformance)) placed in the `tests/` directory.
+1.  **Prerequisites:** Ensure you have the `conformance.test` binary. This has been compiled on an M1 Mac and is available in `tests` directory. For all other architectures, please compile using [distribution-spec conformance suite](https://github.com/opencontainers/distribution-spec/tree/main/conformance).
 2.  **Configuration:** Review and adjust the environment variables in `tests/.env_vars` to configure the registry URL, namespace, and which test workflows to run.
 3.  **Execution:** Run the test script from the project root:
 
