@@ -1,5 +1,7 @@
 # marina-distribution
 
+> This repository was created with using from gemini-2.5-pro-exp-03-25
+
 An implementation of the OCI Distribution Specification.
 
 ## Implemented Features
