@@ -103,6 +103,7 @@ func (reg *Registry) GetBlobHandler(w http.ResponseWriter, r *http.Request) {
 // HeadBlobHandler handles HEAD requests for blobs.
 // Pattern: HEAD /v2/{name}/blobs/{digest}
 func (reg *Registry) HeadBlobHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered HeadBlobHandler for %s", r.URL.Path) // Add entry log
 	repoNameStr := r.PathValue("name")
 	digestStr := r.PathValue("digest")
 
@@ -269,6 +270,7 @@ func (reg *Registry) GetManifestHandler(w http.ResponseWriter, r *http.Request) 
 // HeadManifestHandler handles HEAD requests for manifests.
 // Pattern: HEAD /v2/{name}/manifests/{reference}
 func (reg *Registry) HeadManifestHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered HeadManifestHandler for %s", r.URL.Path) // Add entry log
 	repoNameStr := r.PathValue("name")
 	referenceStr := r.PathValue("reference")
 
@@ -327,6 +329,7 @@ func (reg *Registry) HeadManifestHandler(w http.ResponseWriter, r *http.Request)
 // PutManifestHandler handles manifest uploads.
 // Pattern: PUT /v2/{name}/manifests/{reference}
 func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered PutManifestHandler for %s", r.URL.Path) // Add entry log
 	repoNameStr := r.PathValue("name")
 	referenceStr := r.PathValue("reference")
 
@@ -447,6 +450,7 @@ func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) 
 // StartBlobUploadHandler initiates a new blob upload.
 // Pattern: POST /v2/{name}/blobs/uploads/
 func (reg *Registry) StartBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered StartBlobUploadHandler for %s", r.URL.Path) // Add entry log
 	repoNameStr := r.PathValue("name")
 	repoName := distribution.RepositoryName(repoNameStr)
 	if err := repoName.Validate(); err != nil {
@@ -584,6 +588,7 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 // PutBlobUploadHandler finalizes a blob upload (chunked or monolithic POST/PUT).
 // Pattern: PUT /v2/{name}/blobs/uploads/{uuid}?digest={digest}
 func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered PutBlobUploadHandler for %s", r.URL.Path) // Add entry log
 	repoNameStr := r.PathValue("name")
 	uploadID := r.PathValue("uuid")
 	digestStr := r.URL.Query().Get("digest")
