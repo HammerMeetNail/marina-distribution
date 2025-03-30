@@ -39,6 +39,7 @@ func main() {
 
 	// Blob Upload handlers
 	mux.HandleFunc("POST /v2/{name}/blobs/uploads/", reg.StartBlobUploadHandler)
+	mux.HandleFunc("GET /v2/{name}/blobs/uploads/{uuid}", reg.GetBlobUploadHandler) // Add GET handler for upload status
 	mux.HandleFunc("PATCH /v2/{name}/blobs/uploads/{uuid}", reg.PatchBlobUploadHandler)
 	mux.HandleFunc("PUT /v2/{name}/blobs/uploads/{uuid}", reg.PutBlobUploadHandler) // Note: Query params handled in handler
 

@@ -478,6 +478,43 @@ func (reg *Registry) StartBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 	reg.log.Printf("Started blob upload for %s, upload ID: %s, location: %s", repoName, uploadID, uploadURL)
 }
 
+// GetBlobUploadHandler retrieves the status of a blob upload.
+// Pattern: GET /v2/{name}/blobs/uploads/{uuid}
+func (reg *Registry) GetBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
+	reg.log.Printf(">>> Entered GetBlobUploadHandler for %s", r.URL.Path)
+	repoNameStr := r.PathValue("name")
+	uploadID := r.PathValue("uuid")
+
+	repoName := distribution.RepositoryName(repoNameStr)
+	if err := repoName.Validate(); err != nil {
+		// Note: Spec doesn't explicitly define error for invalid name on GET upload status.
+		// Returning 400 seems reasonable, though 404 might also be argued.
+		reg.sendError(w, r, distribution.ErrorCodeNameInvalid, "Invalid repository name format", http.StatusBadRequest, err)
+		return
+	}
+
+	// Get the current progress (offset) of the upload
+	currentOffset, err := reg.driver.GetUploadProgress(r.Context(), uploadID)
+	if err != nil {
+		if errors.As(err, &storage.UploadNotFoundError{}) {
+			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
+		} else {
+			reg.log.Printf("Error getting upload progress for %s: %v", uploadID, err)
+			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to get upload status", http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	// Success: Return 204 No Content with Location and Range headers
+	uploadURL := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repoName, uploadID)
+	w.Header().Set("Location", uploadURL)
+	// Range header indicates the total number of bytes uploaded so far (0-based inclusive range)
+	w.Header().Set("Range", fmt.Sprintf("0-%d", currentOffset-1))
+	w.WriteHeader(http.StatusNoContent) // 204 No Content
+
+	reg.log.Printf("Handled GET blob upload status for %s/%s, current offset: %d", repoName, uploadID, currentOffset)
+}
+
 // PatchBlobUploadHandler handles chunked blob uploads.
 // Pattern: PATCH /v2/{name}/blobs/uploads/{uuid}
 func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Request) {
@@ -497,52 +534,77 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Parse Content-Range header (e.g., "0-999")
-	contentRange := r.Header.Get("Content-Range")
-	var startOffset, endOffset int64
-	contentRangeRegex := regexp.MustCompile(`^([0-9]+)-([0-9]+)$`) // Regex for byte range
-	matches := contentRangeRegex.FindStringSubmatch(contentRange)
-
-	if len(matches) != 3 {
-		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header format", http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("invalid range format: %s", contentRange))
-		return
-	}
-
+	var startOffset int64
 	var err error
-	startOffset, err = strconv.ParseInt(matches[1], 10, 64)
-	if err != nil {
-		// Should not happen with regex match, but check anyway
-		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range start offset", http.StatusRequestedRangeNotSatisfiable, err)
-		return
-	}
-	endOffset, err = strconv.ParseInt(matches[2], 10, 64)
-	if err != nil {
-		// Should not happen with regex match
-		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range end offset", http.StatusRequestedRangeNotSatisfiable, err)
-		return
+
+	// Parse Content-Range header if present
+	contentRange := r.Header.Get("Content-Range")
+	if contentRange != "" {
+		contentRangeRegex := regexp.MustCompile(`^([0-9]+)-([0-9]+)$`) // Regex for byte range
+		matches := contentRangeRegex.FindStringSubmatch(contentRange)
+
+		// Check if the header format is valid
+		if len(matches) == 3 {
+			// Format is valid, parse start and end offsets
+			var endOffset int64 // Declare endOffset here
+			startOffset, err = strconv.ParseInt(matches[1], 10, 64)
+			if err != nil {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range start offset", http.StatusRequestedRangeNotSatisfiable, err)
+				return
+			}
+			endOffset, err = strconv.ParseInt(matches[2], 10, 64)
+			if err != nil {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range end offset", http.StatusRequestedRangeNotSatisfiable, err)
+				return
+			}
+
+			if endOffset < startOffset {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header: end offset cannot be less than start offset", http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("invalid range %d-%d", startOffset, endOffset))
+				return
+			}
+
+			// Validate Content-Length against Content-Range if range is present
+			contentLengthStr := r.Header.Get("Content-Length")
+			chunkSize, err := strconv.ParseInt(contentLengthStr, 10, 64)
+			if err != nil || chunkSize < 0 {
+				reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Invalid or missing Content-Length header", http.StatusBadRequest, err)
+				return
+			}
+			expectedChunkSize := endOffset - startOffset + 1
+			if chunkSize != expectedChunkSize {
+				reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Content-Length does not match Content-Range", http.StatusBadRequest, fmt.Errorf("range %d-%d implies size %d, but Content-Length is %d", startOffset, endOffset, expectedChunkSize, chunkSize))
+				return
+			}
+			reg.log.Printf("Received PATCH chunk for %s with Content-Range %d-%d", uploadID, startOffset, endOffset)
+			// Fall through to PutUploadChunk below
+		} else {
+			// Content-Range header was present but invalid/empty. Treat as streamed.
+			reg.log.Printf("Received PATCH for %s with invalid Content-Range header: %q. Treating as streamed.", uploadID, contentRange)
+			// Fall through to the streamed logic below (get progress)
+			contentRange = "" // Clear contentRange to trigger streamed logic
+		}
 	}
 
-	if endOffset < startOffset {
-		reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Invalid Content-Range header: end offset cannot be less than start offset", http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("invalid range %d-%d", startOffset, endOffset))
-		return
+	// If contentRange is empty (either missing or invalid format), treat as streamed
+	if contentRange == "" {
+		// Content-Range is missing or invalid - this is a streamed upload chunk.
+		// Get the current offset from the driver.
+		startOffset, err = reg.driver.GetUploadProgress(r.Context(), uploadID)
+		if err != nil {
+			if errors.As(err, &storage.UploadNotFoundError{}) {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found for streamed chunk", http.StatusNotFound, err)
+			} else {
+				reg.log.Printf("Error getting upload progress for %s for streamed chunk: %v", uploadID, err)
+				reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to get upload progress", http.StatusInternalServerError, err)
+			}
+			return
+		}
+		reg.log.Printf("Received streamed PATCH chunk for %s, starting at offset %d", uploadID, startOffset)
+		// Content-Length validation is less critical here, as we just append whatever is sent.
+		// The final PUT with digest will verify the total content.
 	}
 
-	// Validate Content-Length (size of the chunk being sent)
-	contentLengthStr := r.Header.Get("Content-Length")
-	chunkSize, err := strconv.ParseInt(contentLengthStr, 10, 64)
-	if err != nil || chunkSize < 0 {
-		reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Invalid or missing Content-Length header", http.StatusBadRequest, err)
-		return
-	}
-
-	// Check if chunk size matches the range
-	expectedChunkSize := endOffset - startOffset + 1
-	if chunkSize != expectedChunkSize {
-		reg.sendError(w, r, distribution.ErrorCodeSizeInvalid, "Content-Length does not match Content-Range", http.StatusBadRequest, fmt.Errorf("range %d-%d implies size %d, but Content-Length is %d", startOffset, endOffset, expectedChunkSize, chunkSize))
-		return
-	}
-
-	// Call storage driver to put the chunk
+	// Call storage driver to put the chunk at the determined startOffset
 	bytesWritten, err := reg.driver.PutUploadChunk(r.Context(), uploadID, startOffset, r.Body)
 	// Note: r.Body is automatically closed by the http server
 
@@ -578,7 +640,7 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Range", fmt.Sprintf("0-%d", newEndOffset)) // Range is inclusive, 0-based
 	w.WriteHeader(http.StatusAccepted)                         // 202 Accepted
 
-	reg.log.Printf("Handled PATCH blob upload chunk for %s/%s, range %d-%d, bytes written: %d", repoName, uploadID, startOffset, endOffset, bytesWritten)
+	reg.log.Printf("Handled PATCH blob upload chunk for %s/%s, range %d-%d, bytes written: %d", repoName, uploadID, startOffset, newEndOffset, bytesWritten)
 }
 
 // PutBlobUploadHandler finalizes a blob upload (chunked or monolithic POST/PUT).
