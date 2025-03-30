@@ -10,6 +10,7 @@
 
 # Test binary, built with `go test -c`
 *.test
+!conformance.test
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -26,3 +27,6 @@ go.work.sum
 
 # Test data
 registry-data
+junit.xml
+report.html
+tests/registry.log

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag" // Import the flag package
 	"log"
 	"net/http"
 	"time"
@@ -10,15 +11,19 @@ import (
 )
 
 func main() {
-	addr := ":5000"                  // Default address and port
-	storageRoot := "./registry-data" // Default storage location
+	// Define command-line flags
+	addr := flag.String("addr", ":5000", "Address and port to listen on")
+	storagePath := flag.String("storage-path", "./registry-data", "Path to the registry data directory")
 
-	// Initialize storage driver
-	storageDriver, err := filesystem.NewDriver(storageRoot)
+	// Parse the flags
+	flag.Parse()
+
+	// Initialize storage driver using the flag value
+	storageDriver, err := filesystem.NewDriver(*storagePath)
 	if err != nil {
-		log.Fatalf("Failed to initialize filesystem storage driver at %s: %v", storageRoot, err)
+		log.Fatalf("Failed to initialize filesystem storage driver at %s: %v", *storagePath, err)
 	}
-	log.Printf("Using filesystem storage driver at %s", storageRoot)
+	log.Printf("Using filesystem storage driver at %s", *storagePath)
 
 	// Use the enhanced http.ServeMux from Go 1.22+
 	mux := http.NewServeMux()
@@ -56,11 +61,11 @@ func main() {
 	mux.HandleFunc("DELETE /v2/{name}/manifests/{reference}", reg.DeleteManifestHandler)
 	mux.HandleFunc("DELETE /v2/{name}/blobs/{digest}", reg.DeleteBlobHandler)
 
-	log.Printf("Starting OCI Distribution Registry server on %s", addr)
+	log.Printf("Starting OCI Distribution Registry server on %s", *addr)
 
 	// Start the HTTP server
 	server := &http.Server{
-		Addr:    addr,
+		Addr:    *addr, // Use the flag value
 		Handler: mux,
 		// Set reasonable timeouts
 		ReadTimeout:  15 * time.Second,
