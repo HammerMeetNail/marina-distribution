@@ -173,8 +173,9 @@ func (reg *Registry) resolveReferenceToDigest(ctx context.Context, repoName dist
 		}
 		return dgst, nil
 	} else {
-		// Invalid reference format - wrap the sentinel error
-		return "", fmt.Errorf("%w: invalid reference format", distribution.ErrManifestInvalid)
+		// Invalid reference format. Per user feedback on conformance test,
+		// treat invalid format as "not found" rather than "bad request".
+		return "", fmt.Errorf("%w: invalid reference format treated as unknown", distribution.ErrManifestUnknown)
 	}
 }
 
@@ -191,11 +192,8 @@ func (reg *Registry) GetManifestHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	reference := distribution.Reference(referenceStr)
-	// Basic validation of reference format (tag or digest)
-	if err := reference.Validate(); err != nil {
-		reg.sendError(w, r, distribution.ErrorCodeManifestInvalid, "Invalid reference format", http.StatusBadRequest, err)
-		return
-	}
+	// Skip initial reference.Validate() check here per user feedback on conformance test.
+	// Let resolveReferenceToDigest handle format errors (mapping them to 404).
 
 	// Resolve the reference (tag or digest) to a digest
 	dgst, err := reg.resolveReferenceToDigest(r.Context(), repoName, reference)
@@ -281,10 +279,8 @@ func (reg *Registry) HeadManifestHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	reference := distribution.Reference(referenceStr)
-	if err := reference.Validate(); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+	// Skip initial reference.Validate() check here per user feedback on conformance test.
+	// Let resolveReferenceToDigest handle format errors (mapping them to 404).
 
 	// Resolve the reference to a digest
 	dgst, err := reg.resolveReferenceToDigest(r.Context(), repoName, reference)
@@ -610,23 +606,48 @@ func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request
 	// The current filesystem driver's FinishUpload expects the data file to be complete.
 	// Handling an optional body here adds complexity (need to append chunk then finish).
 	// For now, assume the final chunk was sent via PATCH or it was a monolithic POST/PUT.
-	// If r.ContentLength > 0, we might need to handle that final chunk here.
+	// If r.ContentLength > 0, handle the final chunk upload.
 	if r.ContentLength > 0 {
-		// TODO: Handle final chunk upload if necessary. This might involve:
-		// 1. Getting current upload progress.
-		// 2. Parsing Content-Range if present (optional for final PUT chunk?).
-		// 3. Calling PutUploadChunk with r.Body.
-		// 4. Proceeding to FinishUpload only if PutUploadChunk succeeds.
-		reg.sendError(w, r, distribution.ErrorCodeUnsupported, "Uploading final chunk via PUT is not yet supported", http.StatusNotImplemented, nil)
-		reg.log.Printf("Received PUT request with body for upload %s - final chunk via PUT not implemented", uploadID)
-		return
+		// 1. Get current upload progress to determine the offset for this chunk.
+		startOffset, err := reg.driver.GetUploadProgress(r.Context(), uploadID)
+		if err != nil {
+			if errors.As(err, &storage.UploadNotFoundError{}) {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found before final chunk", http.StatusNotFound, err)
+			} else {
+				reg.log.Printf("Error getting upload progress for %s before final chunk: %v", uploadID, err)
+				reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to get upload progress", http.StatusInternalServerError, err)
+			}
+			return
+		}
+
+		// 2. Write the final chunk. Content-Range is optional for the final PUT.
+		// We assume the body contains the *entire* remaining data if Content-Length > 0.
+		// The storage driver should handle appending from the correct offset.
+		bytesWritten, err := reg.driver.PutUploadChunk(r.Context(), uploadID, startOffset, r.Body)
+		if err != nil {
+			if errors.As(err, &storage.UploadNotFoundError{}) {
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found during final chunk", http.StatusNotFound, err)
+			} else if errors.As(err, &storage.InvalidOffsetError{}) {
+				// This indicates a mismatch between expected offset and where the driver tried to write.
+				reg.log.Printf("Invalid offset error during final chunk PUT for %s (expected %d): %v", uploadID, startOffset, err)
+				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Upload state mismatch during final chunk", http.StatusRequestedRangeNotSatisfiable, err) // 416 might be appropriate
+			} else {
+				reg.log.Printf("Error putting final upload chunk for %s: %v", uploadID, err)
+				reg.sendError(w, r, distribution.ErrorCodeUnknown, "Failed to write final upload chunk", http.StatusInternalServerError, err)
+			}
+			return
+		}
+		reg.log.Printf("Wrote final chunk for upload %s, %d bytes starting at offset %d", uploadID, bytesWritten, startOffset)
+		// Note: We don't strictly need to validate bytesWritten against Content-Length here,
+		// as FinishUpload will verify the total size against the finalDigest.
 	}
 
-	// Call storage driver to finalize the upload
+	// 3. Call storage driver to finalize the upload (this happens whether ContentLength was > 0 or not)
 	err := reg.driver.FinishUpload(r.Context(), uploadID, finalDigest)
 	if err != nil {
 		if errors.As(err, &storage.UploadNotFoundError{}) {
-			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
+			// This could happen if the upload was somehow cancelled between chunk write and finish
+			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session disappeared before finalize", http.StatusNotFound, err)
 		} else if errors.As(err, &storage.DigestMismatchError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Provided digest did not match uploaded content", http.StatusBadRequest, err)
 		} else {
