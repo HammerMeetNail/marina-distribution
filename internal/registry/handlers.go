@@ -15,8 +15,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/HammerMeetNail/marina-distribution/internal/storage"
+	// Use the shared types from pkg/distribution
 	"github.com/HammerMeetNail/marina-distribution/pkg/distribution"
+	digest "github.com/opencontainers/go-digest"                 // Re-add go-digest import
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1" // Ensure this import is present
 )
 
 // BaseV2Handler handles requests to the /v2/ endpoint.
@@ -61,7 +63,7 @@ func (reg *Registry) GetBlobHandler(w http.ResponseWriter, r *http.Request) {
 	// Retrieve blob info first to get size
 	fileInfo, err := reg.driver.Stat(r.Context(), dgst)
 	if err != nil {
-		if errors.As(err, &storage.PathNotFoundError{}) { // Use errors.As for interface check
+		if errors.As(err, &distribution.PathNotFoundError{}) { // Use errors.As for interface check
 			reg.sendError(w, r, distribution.ErrorCodeBlobUnknown, "Blob unknown", http.StatusNotFound, err)
 		} else {
 			reg.log.Printf("Error stating blob %s in %s: %v", dgst, repoName, err)
@@ -123,7 +125,7 @@ func (reg *Registry) HeadBlobHandler(w http.ResponseWriter, r *http.Request) {
 	// Stat the blob
 	fileInfo, err := reg.driver.Stat(r.Context(), dgst)
 	if err != nil {
-		if errors.As(err, &storage.PathNotFoundError{}) { // Use errors.As
+		if errors.As(err, &distribution.PathNotFoundError{}) { // Use errors.As
 			w.WriteHeader(http.StatusNotFound)
 		} else {
 			reg.log.Printf("Error stating blob %s in %s for HEAD request: %v", dgst, repoName, err)
@@ -157,7 +159,7 @@ func (reg *Registry) resolveReferenceToDigest(ctx context.Context, repoName dist
 		// It's a tag, resolve it using the storage driver
 		dgst, err := reg.driver.ResolveTag(ctx, repoName, reference.String())
 		if err != nil {
-			if errors.As(err, &storage.TagNotFoundError{}) {
+			if errors.As(err, &distribution.TagNotFoundError{}) {
 				// Wrap the sentinel error corresponding to the code
 				return "", fmt.Errorf("%w: %w", distribution.ErrManifestUnknown, err) // Map storage error to API error
 			}
@@ -224,7 +226,7 @@ func (reg *Registry) GetManifestHandler(w http.ResponseWriter, r *http.Request) 
 	// Note: Even if resolved from tag, we stat by digest for consistency.
 	fileInfo, err := reg.driver.StatManifest(r.Context(), dgst)
 	if err != nil {
-		if errors.As(err, &storage.PathNotFoundError{}) {
+		if errors.As(err, &distribution.PathNotFoundError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeManifestUnknown, "Manifest unknown", http.StatusNotFound, err)
 		} else {
 			reg.log.Printf("Error stating manifest %s in %s: %v", dgst, repoName, err)
@@ -301,7 +303,7 @@ func (reg *Registry) HeadManifestHandler(w http.ResponseWriter, r *http.Request)
 	// Stat the manifest by digest
 	fileInfo, err := reg.driver.StatManifest(r.Context(), dgst)
 	if err != nil {
-		if errors.As(err, &storage.PathNotFoundError{}) {
+		if errors.As(err, &distribution.PathNotFoundError{}) {
 			w.WriteHeader(http.StatusNotFound)
 		} else {
 			reg.log.Printf("Error stating manifest %s in %s for HEAD request: %v", dgst, repoName, err)
@@ -407,7 +409,7 @@ func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) 
 	_, err = reg.driver.PutManifest(r.Context(), calculatedDigest, bytes.NewReader(manifestBytes)) // Use bytes.NewReader
 	if err != nil {
 		// Handle potential DigestMismatchError from storage (shouldn't happen here ideally)
-		if errors.As(err, &storage.DigestMismatchError{}) {
+		if errors.As(err, &distribution.DigestMismatchError{}) {
 			reg.log.Printf("Internal Error: Digest mismatch during PutManifest for %s: %v", calculatedDigest, err)
 			reg.sendError(w, r, distribution.ErrorCodeUnknown, "Internal storage error during manifest put", http.StatusInternalServerError, err)
 		} else {
@@ -430,20 +432,49 @@ func (reg *Registry) PutManifestHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Handle 'subject' field and OCI-Subject header for Referrers API support.
-	var manifest struct {
-		Subject *distribution.Descriptor `json:"subject,omitempty"`
-		// Include other fields if needed for validation, but subject is key here
+	// Handle 'subject' field: Set OCI-Subject header and update referrers index tag.
+	var parsedManifest struct {
+		MediaType    string                   `json:"mediaType"`
+		ArtifactType string                   `json:"artifactType,omitempty"`
+		Subject      *distribution.Descriptor `json:"subject,omitempty"`
+		Annotations  map[string]string        `json:"annotations,omitempty"`
+		Config       *distribution.Descriptor `json:"config,omitempty"` // Needed for artifactType fallback
 	}
-	if err := json.Unmarshal(manifestBytes, &manifest); err == nil { // Attempt to unmarshal
-		if manifest.Subject != nil {
-			subjectDigest := distribution.Digest(manifest.Subject.Digest) // Convert to our Digest type
-			if err := subjectDigest.Validate(); err == nil {              // Validate the subject digest
+	if err := json.Unmarshal(manifestBytes, &parsedManifest); err == nil { // Attempt to unmarshal
+		if parsedManifest.Subject != nil {
+			subjectDigest := distribution.Digest(parsedManifest.Subject.Digest) // Convert to our Digest type
+			if err := subjectDigest.Validate(); err == nil {                    // Validate the subject digest
+				// Set OCI-Subject header
 				w.Header().Set("OCI-Subject", subjectDigest.String())
 				reg.log.Printf("Set OCI-Subject header to %s for manifest %s", subjectDigest, calculatedDigest)
+
+				// Update the referrers index tag for the subject
+				// Create the descriptor for the manifest we just pushed
+				referrerArtifactType, _ := getArtifactTypeFromManifest(manifestBytes) // Reuse helper
+				// Parse the calculated digest string into the required digest.Digest type
+				ociDigest, parseErr := digest.Parse(string(calculatedDigest))
+				if parseErr != nil {
+					// Should not happen if calculatedDigest is valid, but handle defensively
+					reg.log.Printf("Internal error parsing calculated digest %s: %v", calculatedDigest, parseErr)
+					// Continue without updating the index, as the main PUT succeeded.
+				} else {
+					referrerDescriptor := imagespec.Descriptor{
+						MediaType:    parsedManifest.MediaType, // Use parsed media type
+						Size:         int64(len(manifestBytes)),
+						Digest:       ociDigest, // Use the parsed digest.Digest
+						ArtifactType: referrerArtifactType,
+						Annotations:  parsedManifest.Annotations,
+					}
+
+					// Call the helper method (log errors but don't fail the PUT)
+					if updateErr := reg.updateReferrersTagIndex(r.Context(), repoName, subjectDigest, referrerDescriptor); updateErr != nil {
+						reg.log.Printf("Error updating referrers tag index for subject %s after putting manifest %s: %v", subjectDigest, calculatedDigest, updateErr)
+					}
+				}
+
 			} else {
 				// Log if subject digest is invalid, but don't fail the request (spec doesn't mandate failure here)
-				reg.log.Printf("Manifest %s contained subject with invalid digest: %s, error: %v", calculatedDigest, manifest.Subject.Digest, err)
+				reg.log.Printf("Manifest %s contained subject with invalid digest: %s, error: %v", calculatedDigest, parsedManifest.Subject.Digest, err)
 			}
 		}
 	} else {
@@ -515,7 +546,7 @@ func (reg *Registry) GetBlobUploadHandler(w http.ResponseWriter, r *http.Request
 	// Get the current progress (offset) of the upload
 	currentOffset, err := reg.driver.GetUploadProgress(r.Context(), uploadID)
 	if err != nil {
-		if errors.As(err, &storage.UploadNotFoundError{}) {
+		if errors.As(err, &distribution.UploadNotFoundError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
 		} else {
 			reg.log.Printf("Error getting upload progress for %s: %v", uploadID, err)
@@ -610,7 +641,7 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 		// Get the current offset from the driver.
 		startOffset, err = reg.driver.GetUploadProgress(r.Context(), uploadID)
 		if err != nil {
-			if errors.As(err, &storage.UploadNotFoundError{}) {
+			if errors.As(err, &distribution.UploadNotFoundError{}) {
 				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found for streamed chunk", http.StatusNotFound, err)
 			} else {
 				reg.log.Printf("Error getting upload progress for %s for streamed chunk: %v", uploadID, err)
@@ -628,9 +659,9 @@ func (reg *Registry) PatchBlobUploadHandler(w http.ResponseWriter, r *http.Reque
 	// Note: r.Body is automatically closed by the http server
 
 	if err != nil {
-		if errors.As(err, &storage.UploadNotFoundError{}) {
+		if errors.As(err, &distribution.UploadNotFoundError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found", http.StatusNotFound, err)
-		} else if errors.As(err, &storage.InvalidOffsetError{}) {
+		} else if errors.As(err, &distribution.InvalidOffsetError{}) {
 			// If offset is wrong, return 416 Range Not Satisfiable
 			// Get current progress to inform client
 			currentOffset, progressErr := reg.driver.GetUploadProgress(r.Context(), uploadID)
@@ -692,7 +723,7 @@ func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request
 		// 1. Get current upload progress to determine the offset for this chunk.
 		startOffset, err := reg.driver.GetUploadProgress(r.Context(), uploadID)
 		if err != nil {
-			if errors.As(err, &storage.UploadNotFoundError{}) {
+			if errors.As(err, &distribution.UploadNotFoundError{}) {
 				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found before final chunk", http.StatusNotFound, err)
 			} else {
 				reg.log.Printf("Error getting upload progress for %s before final chunk: %v", uploadID, err)
@@ -706,9 +737,9 @@ func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request
 		// The storage driver should handle appending from the correct offset.
 		bytesWritten, err := reg.driver.PutUploadChunk(r.Context(), uploadID, startOffset, r.Body)
 		if err != nil {
-			if errors.As(err, &storage.UploadNotFoundError{}) {
+			if errors.As(err, &distribution.UploadNotFoundError{}) {
 				reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session not found during final chunk", http.StatusNotFound, err)
-			} else if errors.As(err, &storage.InvalidOffsetError{}) {
+			} else if errors.As(err, &distribution.InvalidOffsetError{}) {
 				// This indicates a mismatch between expected offset and where the driver tried to write.
 				reg.log.Printf("Invalid offset error during final chunk PUT for %s (expected %d): %v", uploadID, startOffset, err)
 				reg.sendError(w, r, distribution.ErrorCodeBlobUploadInvalid, "Upload state mismatch during final chunk", http.StatusRequestedRangeNotSatisfiable, err) // 416 might be appropriate
@@ -726,10 +757,10 @@ func (reg *Registry) PutBlobUploadHandler(w http.ResponseWriter, r *http.Request
 	// 3. Call storage driver to finalize the upload (this happens whether ContentLength was > 0 or not)
 	err := reg.driver.FinishUpload(r.Context(), uploadID, finalDigest)
 	if err != nil {
-		if errors.As(err, &storage.UploadNotFoundError{}) {
+		if errors.As(err, &distribution.UploadNotFoundError{}) {
 			// This could happen if the upload was somehow cancelled between chunk write and finish
 			reg.sendError(w, r, distribution.ErrorCodeBlobUploadUnknown, "Upload session disappeared before finalize", http.StatusNotFound, err)
-		} else if errors.As(err, &storage.DigestMismatchError{}) {
+		} else if errors.As(err, &distribution.DigestMismatchError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeDigestInvalid, "Provided digest did not match uploaded content", http.StatusBadRequest, err)
 		} else {
 			reg.log.Printf("Error finishing upload %s with digest %s: %v", uploadID, finalDigest, err)
@@ -921,7 +952,7 @@ func (reg *Registry) DeleteManifestHandler(w http.ResponseWriter, r *http.Reques
 		tagName := reference.String()
 		err = reg.driver.UntagManifest(r.Context(), repoName, tagName)
 		if err != nil {
-			if errors.As(err, &storage.TagNotFoundError{}) {
+			if errors.As(err, &distribution.TagNotFoundError{}) {
 				reg.sendError(w, r, distribution.ErrorCodeManifestUnknown, "Tag not found", http.StatusNotFound, err)
 			} else {
 				reg.log.Printf("Error untagging %s/%s: %v", repoName, tagName, err)
@@ -946,7 +977,7 @@ func (reg *Registry) DeleteManifestHandler(w http.ResponseWriter, r *http.Reques
 
 		err = reg.driver.DeleteManifest(r.Context(), dgst)
 		if err != nil {
-			if errors.As(err, &storage.PathNotFoundError{}) {
+			if errors.As(err, &distribution.PathNotFoundError{}) {
 				reg.sendError(w, r, distribution.ErrorCodeManifestUnknown, "Manifest not found", http.StatusNotFound, err)
 			} else {
 				reg.log.Printf("Error deleting manifest %s in %s: %v", dgst, repoName, err)
@@ -988,7 +1019,7 @@ func (reg *Registry) DeleteBlobHandler(w http.ResponseWriter, r *http.Request) {
 	// Call storage driver to delete the blob
 	err := reg.driver.Delete(r.Context(), dgst)
 	if err != nil {
-		if errors.As(err, &storage.PathNotFoundError{}) {
+		if errors.As(err, &distribution.PathNotFoundError{}) {
 			reg.sendError(w, r, distribution.ErrorCodeBlobUnknown, "Blob not found", http.StatusNotFound, err)
 		} else {
 			reg.log.Printf("Error deleting blob %s in %s: %v", dgst, repoName, err)

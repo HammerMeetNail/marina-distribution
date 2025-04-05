@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"github.com/HammerMeetNail/marina-distribution/internal/registry"
-	"github.com/HammerMeetNail/marina-distribution/internal/storage/filesystem"
+	"github.com/HammerMeetNail/marina-distribution/internal/storage" // Import storage package for the factory
+	"github.com/HammerMeetNail/marina-distribution/pkg/distribution" // Import distribution for config types
 )
 
 func main() {
@@ -18,12 +19,23 @@ func main() {
 	// Parse the flags
 	flag.Parse()
 
-	// Initialize storage driver using the flag value
-	storageDriver, err := filesystem.NewDriver(*storagePath)
-	if err != nil {
-		log.Fatalf("Failed to initialize filesystem storage driver at %s: %v", *storagePath, err)
+	// Create storage configuration based on flags
+	// For now, we only support filesystem, hardcoding the type.
+	// A more advanced setup might use a config file (e.g., YAML) parsed with Viper.
+	storageConfig := distribution.Config{
+		Type: distribution.FilesystemDriverType,
+		Filesystem: distribution.FilesystemConfig{
+			RootDirectory: *storagePath,
+		},
+		// Add placeholders for other configs if needed later
 	}
-	log.Printf("Using filesystem storage driver at %s", *storagePath)
+
+	// Initialize storage driver using the factory
+	storageDriver, err := storage.NewDriver(storageConfig)
+	if err != nil {
+		log.Fatalf("Failed to initialize storage driver: %v", err)
+	}
+	log.Printf("Using %s storage driver at %s", storageConfig.Type, storageConfig.Filesystem.RootDirectory)
 
 	// Use the enhanced http.ServeMux from Go 1.22+
 	mux := http.NewServeMux()

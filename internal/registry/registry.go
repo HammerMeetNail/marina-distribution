@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"         // Re-add bytes import
 	"context"       // Add context import
 	"encoding/json" // Add json import
 	"errors"        // Re-add errors import
@@ -11,9 +12,8 @@ import (
 	"sort"    // Add sort import
 	"strings" // Add strings import
 
-	"github.com/HammerMeetNail/marina-distribution/internal/storage"
+	// Use the storage driver interface from pkg/distribution
 	"github.com/HammerMeetNail/marina-distribution/pkg/distribution"
-	digest "github.com/opencontainers/go-digest"                 // Import go-digest
 	"github.com/opencontainers/image-spec/specs-go"              // Import base specs package
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1" // Keep v1 alias
 )
@@ -21,12 +21,12 @@ import (
 // Registry provides the core registry application logic,
 // coordinating between handlers and the storage driver.
 type Registry struct {
-	driver storage.StorageDriver
-	log    *log.Logger // Or a more structured logger
+	driver distribution.StorageDriver // Use the interface from pkg/distribution
+	log    *log.Logger                // Or a more structured logger
 }
 
 // NewRegistry creates a new Registry instance.
-func NewRegistry(driver storage.StorageDriver) *Registry {
+func NewRegistry(driver distribution.StorageDriver) *Registry { // Expect the interface from pkg/distribution
 	// For now, use the standard logger writing to stderr.
 	// Could be replaced with a more sophisticated logger later.
 	logger := log.New(os.Stderr, "[Registry] ", log.LstdFlags)
@@ -128,90 +128,11 @@ func getArtifactTypeFromManifest(manifestContent []byte) (string, error) {
 func (reg *Registry) GetReferrers(ctx context.Context, repoName distribution.RepositoryName, subjectDigest distribution.Digest, artifactTypeFilter string) (*imagespec.Index, bool, error) {
 	reg.log.Printf("Core: GetReferrers called for %s/%s (filter: %s)", repoName, subjectDigest, artifactTypeFilter)
 
+	// Referrers are found *only* via the OCI tag schema fallback mechanism.
+	// We no longer scan all manifests for a 'subject' field.
 	foundReferrers := make(map[distribution.Digest]imagespec.Descriptor)
 
-	// --- 1. Scan manifests for subject match ---
-	allManifestDigests, err := reg.driver.ListManifestDigests(ctx, repoName) // repoName ignored by current driver
-	if err != nil {
-		reg.log.Printf("Error listing manifest digests: %v", err)
-		// Return empty index on error listing manifests? Or return error?
-		// Let's return error for now.
-		return nil, false, fmt.Errorf("failed to list manifests: %w", err)
-	}
-
-	reg.log.Printf("Scanning %d potential manifest digests globally.", len(allManifestDigests))
-	for _, dgst := range allManifestDigests {
-		reg.log.Printf("Checking manifest: %s", dgst)
-		// Fetch manifest content
-		reader, err := reg.driver.GetManifest(ctx, dgst)
-		if err != nil {
-			reg.log.Printf("Error fetching manifest %s during scan: %v", dgst, err)
-			continue // Skip this manifest
-		}
-		manifestBytes, readErr := io.ReadAll(reader)
-		reader.Close() // Close immediately after reading
-		if readErr != nil {
-			reg.log.Printf("Error reading manifest %s during scan: %v", dgst, readErr)
-			continue // Skip this manifest
-		}
-
-		// Unmarshal just enough to check the subject field
-		var manifest struct {
-			Subject      *imagespec.Descriptor `json:"subject"`
-			MediaType    string                `json:"mediaType"` // Needed for descriptor
-			Size         int64                 // Calculated below
-			Annotations  map[string]string     `json:"annotations"`  // Needed for descriptor
-			ArtifactType string                `json:"artifactType"` // Needed for artifactType calc
-			Config       imagespec.Descriptor  `json:"config"`       // Needed for artifactType calc
-		}
-		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-			reg.log.Printf("Warning: Could not unmarshal manifest %s to check subject: %v", dgst, err)
-			continue
-		}
-
-		// Check if subject matches
-		if manifest.Subject != nil {
-			manifestSubjectDigestStr := manifest.Subject.Digest.String()
-			reg.log.Printf("Manifest %s has subject: %s", dgst, manifestSubjectDigestStr)
-			// Parse the digest from the manifest's subject field into our internal type
-			manifestSubjectDigest := distribution.Digest(manifestSubjectDigestStr)
-			// Validate the parsed digest before comparing
-			if err := manifestSubjectDigest.Validate(); err == nil {
-				if manifestSubjectDigest == subjectDigest {
-					reg.log.Printf("MATCH FOUND: Referrer %s points to subject %s", dgst, subjectDigest)
-					// Create descriptor
-					artifactType, _ := getArtifactTypeFromManifest(manifestBytes) // Ignore error here
-
-					// Parse the digest string into digest.Digest type for the descriptor
-					parsedDigest := digest.Digest(dgst.String())
-					if err := parsedDigest.Validate(); err != nil {
-						reg.log.Printf("Warning: Invalid digest %s for descriptor, skipping.", dgst.String())
-						continue
-					}
-
-					desc := imagespec.Descriptor{
-						MediaType:    manifest.MediaType,
-						Size:         int64(len(manifestBytes)),
-						Digest:       parsedDigest, // Use the parsed digest.Digest type
-						ArtifactType: artifactType,
-						Annotations:  manifest.Annotations,
-					}
-					// Use the referrer's digest as the key to handle potential duplicates from tag schema later (if re-enabled)
-					if _, exists := foundReferrers[dgst]; !exists {
-						foundReferrers[dgst] = desc
-					} else {
-						reg.log.Printf("Warning: Duplicate referrer digest %s encountered during scan.", dgst)
-					}
-				}
-			} else {
-				reg.log.Printf("Warning: Invalid digest format in subject field of manifest %s: %v", dgst, err)
-			}
-		} else {
-			reg.log.Printf("Manifest %s has no subject field.", dgst)
-		}
-	}
-
-	// --- 2. Check tag schema fallback ---
+	// --- Check tag schema fallback ---
 	referrersTagName, err := calculateReferrersTag(subjectDigest)
 	if err != nil {
 		reg.log.Printf("Error calculating referrers tag name for %s: %v", subjectDigest, err)
@@ -259,7 +180,7 @@ func (reg *Registry) GetReferrers(ctx context.Context, repoName distribution.Rep
 					}
 				}
 			}
-		} else if !errors.As(err, &storage.TagNotFoundError{}) { // This line requires 'errors' import
+		} else if !errors.As(err, &distribution.TagNotFoundError{}) { // Use error type from distribution
 			// Log errors other than "tag not found"
 			reg.log.Printf("Error resolving referrers tag %s: %v", referrersTagName, err)
 		}
@@ -301,4 +222,127 @@ func (reg *Registry) GetReferrers(ctx context.Context, repoName distribution.Rep
 		len(finalDescriptors), repoName, subjectDigest, artifactTypeFilter, filteringApplied && artifactTypeFilter != "") // Only true if filter was non-empty and applied
 
 	return responseIndex, filteringApplied && artifactTypeFilter != "", nil
+}
+
+// updateReferrersTagIndex manages the OCI Image Index manifest used for the
+// tag schema fallback mechanism for the Referrers API. It ensures that when
+// a manifest (`referrerManifest`) declares a `subjectDigest`, the referrer's
+// descriptor is added to the index pointed to by the tag `sha256-<subjectDigest>`.
+func (reg *Registry) updateReferrersTagIndex(ctx context.Context, repoName distribution.RepositoryName, subjectDigest distribution.Digest, referrerDescriptor imagespec.Descriptor) error {
+	// 1. Calculate the fallback tag name
+	referrersTagName, err := calculateReferrersTag(subjectDigest)
+	if err != nil {
+		// This should ideally not happen if subjectDigest is valid, but handle defensively
+		return fmt.Errorf("failed to calculate referrers tag name for subject %s: %w", subjectDigest, err)
+	}
+	reg.log.Printf("Updating referrers index for subject %s using tag %s", subjectDigest, referrersTagName)
+
+	// 2. Resolve the tag to find the current index digest (if it exists)
+	currentIndexDigest, err := reg.driver.ResolveTag(ctx, repoName, referrersTagName)
+	var currentIndex imagespec.Index
+	currentIndexExists := false
+	if err == nil {
+		// Tag exists, try to fetch the current index manifest
+		reader, getErr := reg.driver.GetManifest(ctx, currentIndexDigest)
+		if getErr == nil {
+			defer reader.Close()
+			indexBytes, readErr := io.ReadAll(reader)
+			if readErr == nil {
+				if jsonErr := json.Unmarshal(indexBytes, &currentIndex); jsonErr == nil {
+					// Successfully fetched and unmarshalled the current index
+					if currentIndex.MediaType == imagespec.MediaTypeImageIndex {
+						currentIndexExists = true
+						reg.log.Printf("Found existing referrers index %s for tag %s", currentIndexDigest, referrersTagName)
+					} else {
+						reg.log.Printf("Warning: Manifest %s pointed to by referrers tag %s is not an OCI index (mediaType: %s). Creating new index.", currentIndexDigest, referrersTagName, currentIndex.MediaType)
+						// Treat as non-existent, will create a new one below
+					}
+				} else {
+					reg.log.Printf("Warning: Failed to unmarshal existing referrers index %s for tag %s: %v. Creating new index.", currentIndexDigest, referrersTagName, jsonErr)
+					// Treat as non-existent
+				}
+			} else {
+				reg.log.Printf("Warning: Failed to read existing referrers index %s for tag %s: %v. Creating new index.", currentIndexDigest, referrersTagName, readErr)
+				// Treat as non-existent
+			}
+		} else if !errors.As(getErr, &distribution.PathNotFoundError{}) {
+			// Log error if fetching failed for reasons other than not found
+			reg.log.Printf("Warning: Failed to fetch existing referrers index %s for tag %s: %v. Creating new index.", currentIndexDigest, referrersTagName, getErr)
+			// Treat as non-existent
+		}
+		// If PathNotFoundError, currentIndexExists remains false, proceed to create new index.
+
+	} else if !errors.As(err, &distribution.TagNotFoundError{}) {
+		// Log error if resolving tag failed for reasons other than not found
+		reg.log.Printf("Warning: Failed to resolve referrers tag %s: %v. Cannot update index.", referrersTagName, err)
+		return fmt.Errorf("failed to resolve existing referrers tag %s: %w", referrersTagName, err) // Return error, cannot proceed
+	}
+
+	// 3. Initialize a new index if none exists
+	if !currentIndexExists {
+		reg.log.Printf("No valid existing referrers index found for tag %s. Creating new index.", referrersTagName)
+		currentIndex = imagespec.Index{
+			Versioned: specs.Versioned{
+				SchemaVersion: 2,
+			},
+			MediaType: imagespec.MediaTypeImageIndex,
+			Manifests: []imagespec.Descriptor{}, // Initialize empty slice
+		}
+	}
+
+	// 4. Add or update the referrer descriptor in the index
+	found := false
+	for i, existingDesc := range currentIndex.Manifests {
+		if existingDesc.Digest == referrerDescriptor.Digest {
+			// Update existing entry if needed (e.g., annotations changed)
+			// For simplicity, just replace it.
+			currentIndex.Manifests[i] = referrerDescriptor
+			found = true
+			reg.log.Printf("Updated descriptor for %s in referrers index for tag %s", referrerDescriptor.Digest, referrersTagName)
+			break
+		}
+	}
+	if !found {
+		currentIndex.Manifests = append(currentIndex.Manifests, referrerDescriptor)
+		reg.log.Printf("Added descriptor for %s to referrers index for tag %s", referrerDescriptor.Digest, referrersTagName)
+	}
+
+	// 5. Marshal the updated index
+	updatedIndexBytes, err := json.MarshalIndent(currentIndex, "", "  ") // Use MarshalIndent for readability
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated referrers index for tag %s: %w", referrersTagName, err)
+	}
+
+	// 6. Calculate the digest of the updated index
+	// Use SHA256 as the default/standard for index digests
+	hashFunc, err := distribution.GetHashFunc(distribution.SHA256)
+	if err != nil {
+		return fmt.Errorf("failed to get hash function for updated referrers index: %w", err) // Should not happen
+	}
+	hasher := hashFunc.New()
+	hasher.Write(updatedIndexBytes)
+	updatedIndexDigest := distribution.NewDigest(distribution.SHA256, hasher)
+
+	// 7. Store the updated index manifest
+	_, err = reg.driver.PutManifest(ctx, updatedIndexDigest, bytes.NewReader(updatedIndexBytes))
+	if err != nil {
+		// Check for digest mismatch, though unlikely here
+		if errors.As(err, &distribution.DigestMismatchError{}) {
+			reg.log.Printf("Internal Error: Digest mismatch during PutManifest for updated referrers index %s: %v", updatedIndexDigest, err)
+		}
+		return fmt.Errorf("failed to store updated referrers index %s for tag %s: %w", updatedIndexDigest, referrersTagName, err)
+	}
+	reg.log.Printf("Stored updated referrers index %s for tag %s", updatedIndexDigest, referrersTagName)
+
+	// 8. Update the tag to point to the new index digest
+	err = reg.driver.TagManifest(ctx, repoName, referrersTagName, updatedIndexDigest)
+	if err != nil {
+		// Log the error, but the index was stored successfully.
+		reg.log.Printf("Error updating referrers tag %s to point to new index %s: %v", referrersTagName, updatedIndexDigest, err)
+		// Don't return error here, as the primary operation (storing index) succeeded.
+	} else {
+		reg.log.Printf("Updated referrers tag %s to point to index %s", referrersTagName, updatedIndexDigest)
+	}
+
+	return nil // Success
 }

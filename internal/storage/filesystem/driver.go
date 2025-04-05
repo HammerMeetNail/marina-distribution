@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/HammerMeetNail/marina-distribution/internal/storage"
+	// Use the shared types from pkg/distribution
 	"github.com/HammerMeetNail/marina-distribution/pkg/distribution"
 )
 
@@ -26,18 +26,20 @@ const (
 	tempSuffix         = ".tmp"
 )
 
-// Driver implements the storage.StorageDriver interface using the local filesystem.
+// Driver implements the distribution.StorageDriver interface using the local filesystem.
 type Driver struct {
 	rootDirectory string
 }
 
-// NewDriver creates a new filesystem storage driver rooted at rootDirectory.
+// NewDriver creates a new filesystem storage driver using the provided configuration.
 // It creates the necessary subdirectories if they don't exist.
-func NewDriver(rootDirectory string) (*Driver, error) {
-	root := filepath.Clean(rootDirectory)
-	if root == "" {
-		return nil, fmt.Errorf("root directory cannot be empty")
+func NewDriver(config distribution.FilesystemConfig) (*Driver, error) {
+	// Validate the specific config part (already done in factory, but good practice)
+	// Note: Validate is defined on distribution.FilesystemConfig
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid filesystem config: %w", err)
 	}
+	root := filepath.Clean(config.RootDirectory)
 
 	// Create necessary subdirectories
 	blobPath := filepath.Join(root, blobDataFolder)
@@ -58,6 +60,7 @@ func NewDriver(rootDirectory string) (*Driver, error) {
 // blobPath returns the path for a blob based on its digest.
 // It uses a sharded structure (e.g., /blobs/sha256/ab/abcdef123...) to avoid too many files in one directory.
 func (d *Driver) blobPath(dgst distribution.Digest) (string, error) {
+	// Note: Validate is defined on distribution.Digest
 	if err := dgst.Validate(); err != nil {
 		return "", fmt.Errorf("invalid digest: %w", err)
 	}
@@ -82,7 +85,8 @@ func (d *Driver) GetContent(ctx context.Context, dgst distribution.Digest) (io.R
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return nil, distribution.PathNotFoundError{Path: path}
 		}
 		return nil, fmt.Errorf("failed to open blob %s: %w", dgst, err)
 	}
@@ -134,9 +138,11 @@ func (d *Driver) PutContent(ctx context.Context, dgst distribution.Digest, conte
 	}
 
 	// Verify the calculated digest
+	// Note: NewDigest is defined in distribution package
 	calculatedDigest := distribution.NewDigest(dgst.Algorithm(), hasher)
 	if calculatedDigest != dgst {
-		err = storage.DigestMismatchError{Provided: dgst, Actual: calculatedDigest}
+		// Use the error type from distribution package
+		err = distribution.DigestMismatchError{Provided: dgst, Actual: calculatedDigest}
 		return bytesWritten, err // Temp file will be removed by defer
 	}
 
@@ -163,26 +169,31 @@ func (d *Driver) PutContent(ctx context.Context, dgst distribution.Digest, conte
 }
 
 // Stat retrieves information about a blob identified by its digest.
-func (d *Driver) Stat(ctx context.Context, dgst distribution.Digest) (storage.FileInfo, error) {
+func (d *Driver) Stat(ctx context.Context, dgst distribution.Digest) (distribution.FileInfo, error) {
 	path, err := d.blobPath(dgst)
 	if err != nil {
-		return storage.FileInfo{}, err // Invalid digest format
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, err // Invalid digest format
 	}
 
 	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storage.FileInfo{}, storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return distribution.FileInfo{}, distribution.PathNotFoundError{Path: path}
 		}
-		return storage.FileInfo{}, fmt.Errorf("failed to stat blob %s: %w", dgst, err)
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, fmt.Errorf("failed to stat blob %s: %w", dgst, err)
 	}
 
 	if fi.IsDir() {
 		// Blobs should not be directories
-		return storage.FileInfo{}, fmt.Errorf("blob path is a directory: %s", path)
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, fmt.Errorf("blob path is a directory: %s", path)
 	}
 
-	return storage.FileInfo{
+	// Return the type from distribution package
+	return distribution.FileInfo{
 		Path:    path, // Or perhaps just the digest? TBD
 		Size:    fi.Size(),
 		ModTime: fi.ModTime(),
@@ -201,7 +212,8 @@ func (d *Driver) Delete(ctx context.Context, dgst distribution.Digest) error {
 	err = os.Remove(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return distribution.PathNotFoundError{Path: path}
 		}
 		return fmt.Errorf("failed to delete blob %s: %w", dgst, err)
 	}
@@ -256,7 +268,8 @@ func (d *Driver) PutUploadChunk(ctx context.Context, uploadID string, offset int
 	// Check if upload session exists (directory exists)
 	if _, err := os.Stat(uploadDir); err != nil {
 		if os.IsNotExist(err) {
-			return 0, storage.UploadNotFoundError{UploadID: uploadID}
+			// Use the error type from distribution package
+			return 0, distribution.UploadNotFoundError{UploadID: uploadID}
 		}
 		return 0, fmt.Errorf("failed to stat upload directory %s: %w", uploadDir, err)
 	}
@@ -274,7 +287,8 @@ func (d *Driver) PutUploadChunk(ctx context.Context, uploadID string, offset int
 		return 0, fmt.Errorf("failed to seek upload data file %s: %w", dataPath, err)
 	}
 	if currentSize != offset {
-		return 0, storage.InvalidOffsetError{UploadID: uploadID, Offset: offset}
+		// Use the error type from distribution package
+		return 0, distribution.InvalidOffsetError{UploadID: uploadID, Offset: offset}
 	}
 
 	// Append the chunk data
@@ -298,7 +312,8 @@ func (d *Driver) GetUploadProgress(ctx context.Context, uploadID string) (offset
 			// Check if the directory itself exists. If not, the upload is unknown.
 			// If the directory exists but the file doesn't, it means 0 bytes were uploaded.
 			if _, dirErr := os.Stat(uploadDir); os.IsNotExist(dirErr) {
-				return 0, storage.UploadNotFoundError{UploadID: uploadID}
+				// Use the error type from distribution package
+				return 0, distribution.UploadNotFoundError{UploadID: uploadID}
 			}
 			// Directory exists, but no data file yet (0 bytes uploaded)
 			return 0, nil
@@ -340,10 +355,12 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 
 	// Check if upload session exists
 	if _, dirErr := os.Stat(uploadDir); os.IsNotExist(dirErr) {
-		return storage.UploadNotFoundError{UploadID: uploadID}
+		// Use the error type from distribution package
+		return distribution.UploadNotFoundError{UploadID: uploadID}
 	}
 
 	// Ensure the final digest is valid before proceeding
+	// Note: Validate is defined on distribution.Digest
 	if err := finalDigest.Validate(); err != nil {
 		return fmt.Errorf("invalid final digest provided: %w", err)
 	}
@@ -355,7 +372,8 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 			// Data file doesn't exist, maybe 0 bytes uploaded? Or chunking error?
 			// Treat as upload not found or incomplete for simplicity here.
 			// A more robust implementation might check metadata if stored.
-			return storage.UploadNotFoundError{UploadID: uploadID} // Or a different error?
+			// Use the error type from distribution package
+			return distribution.UploadNotFoundError{UploadID: uploadID} // Or a different error?
 		}
 		return fmt.Errorf("failed to open upload data file %s: %w", dataPath, err)
 	}
@@ -371,6 +389,7 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 	if _, err := io.Copy(hasher, dataFile); err != nil {
 		return fmt.Errorf("failed to hash uploaded data file %s: %w", dataPath, err)
 	}
+	// Note: NewDigest is defined in distribution package
 	calculatedDigest := distribution.NewDigest(finalDigest.Algorithm(), hasher)
 
 	// Compare with the expected final digest
@@ -379,7 +398,8 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 		if cleanupErr := os.RemoveAll(uploadDir); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
 			fmt.Fprintf(os.Stderr, "warning: failed to cleanup upload directory %s after digest mismatch: %v\n", uploadDir, cleanupErr)
 		}
-		return storage.DigestMismatchError{Provided: finalDigest, Actual: calculatedDigest}
+		// Use the error type from distribution package
+		return distribution.DigestMismatchError{Provided: finalDigest, Actual: calculatedDigest}
 	}
 
 	// Digests match, determine final blob path
@@ -420,6 +440,7 @@ func (d *Driver) FinishUpload(ctx context.Context, uploadID string, finalDigest 
 // manifestPath returns the storage path for a manifest based on its digest.
 // Uses the same sharding logic as blobs.
 func (d *Driver) manifestPath(dgst distribution.Digest) (string, error) {
+	// Note: Validate is defined on distribution.Digest
 	if err := dgst.Validate(); err != nil {
 		return "", fmt.Errorf("invalid digest: %w", err)
 	}
@@ -443,7 +464,8 @@ func (d *Driver) GetManifest(ctx context.Context, dgst distribution.Digest) (io.
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return nil, distribution.PathNotFoundError{Path: path}
 		}
 		return nil, fmt.Errorf("failed to open manifest %s: %w", dgst, err)
 	}
@@ -494,9 +516,11 @@ func (d *Driver) PutManifest(ctx context.Context, dgst distribution.Digest, cont
 	}
 
 	// Verify calculated digest
+	// Note: NewDigest is defined in distribution package
 	calculatedDigest := distribution.NewDigest(dgst.Algorithm(), hasher)
 	if calculatedDigest != dgst {
-		err = storage.DigestMismatchError{Provided: dgst, Actual: calculatedDigest}
+		// Use the error type from distribution package
+		err = distribution.DigestMismatchError{Provided: dgst, Actual: calculatedDigest}
 		return bytesWritten, err // Temp file removed by defer
 	}
 
@@ -522,28 +546,33 @@ func (d *Driver) PutManifest(ctx context.Context, dgst distribution.Digest, cont
 }
 
 // StatManifest retrieves information about a manifest identified by its digest.
-func (d *Driver) StatManifest(ctx context.Context, dgst distribution.Digest) (storage.FileInfo, error) {
+func (d *Driver) StatManifest(ctx context.Context, dgst distribution.Digest) (distribution.FileInfo, error) {
 	path, err := d.manifestPath(dgst)
 	if err != nil {
-		return storage.FileInfo{}, err // Invalid digest format
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, err // Invalid digest format
 	}
 
 	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storage.FileInfo{}, storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return distribution.FileInfo{}, distribution.PathNotFoundError{Path: path}
 		}
-		return storage.FileInfo{}, fmt.Errorf("failed to stat manifest %s: %w", dgst, err)
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, fmt.Errorf("failed to stat manifest %s: %w", dgst, err)
 	}
 
 	if fi.IsDir() {
 		// Manifests should not be directories
-		return storage.FileInfo{}, fmt.Errorf("manifest path is a directory: %s", path)
+		// Return the zero value of the type from distribution package
+		return distribution.FileInfo{}, fmt.Errorf("manifest path is a directory: %s", path)
 	}
 
 	// Note: We assume the file content matches the digest for Stat operations.
 	// Verification happens during PutManifest.
-	return storage.FileInfo{
+	// Return the type from distribution package
+	return distribution.FileInfo{
 		Path:    path, // Or perhaps just the digest? TBD
 		Size:    fi.Size(),
 		ModTime: fi.ModTime(),
@@ -562,7 +591,8 @@ func (d *Driver) DeleteManifest(ctx context.Context, dgst distribution.Digest) e
 	err = os.Remove(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storage.PathNotFoundError{Path: path}
+			// Use the error type from distribution package
+			return distribution.PathNotFoundError{Path: path}
 		}
 		return fmt.Errorf("failed to delete manifest %s: %w", dgst, err)
 	}
@@ -597,8 +627,8 @@ func (d *Driver) ResolveTag(ctx context.Context, repoName distribution.Repositor
 	contentBytes, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Use the specific TagNotFoundError
-			return "", storage.TagNotFoundError{Repository: repoName, Tag: tagName}
+			// Use the error type from distribution package
+			return "", distribution.TagNotFoundError{Repository: repoName, Tag: tagName}
 		}
 		return "", fmt.Errorf("failed to read tag file %s: %w", path, err)
 	}
@@ -647,6 +677,7 @@ func (d *Driver) GetTags(ctx context.Context, repoName distribution.RepositoryNa
 
 // TagManifest associates a tag with a manifest digest in a specific repository.
 func (d *Driver) TagManifest(ctx context.Context, repoName distribution.RepositoryName, tagName string, dgst distribution.Digest) error {
+	// Note: Validate is defined on distribution.Digest
 	if err := dgst.Validate(); err != nil {
 		return fmt.Errorf("invalid digest provided for tagging: %w", err)
 	}
@@ -680,8 +711,8 @@ func (d *Driver) UntagManifest(ctx context.Context, repoName distribution.Reposi
 	err := os.Remove(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// If the tag file doesn't exist, return the specific TagNotFoundError
-			return storage.TagNotFoundError{Repository: repoName, Tag: tagName}
+			// If the tag file doesn't exist, return the specific error type from distribution package
+			return distribution.TagNotFoundError{Repository: repoName, Tag: tagName}
 		}
 		return fmt.Errorf("failed to delete tag file %s: %w", path, err)
 	}
@@ -690,87 +721,6 @@ func (d *Driver) UntagManifest(ctx context.Context, repoName distribution.Reposi
 	return nil
 }
 
-// ListManifestDigests retrieves a list of all manifest digests stored globally.
-// Note: The current filesystem layout stores manifests globally by digest, not per-repository.
-// The repoName parameter is included for interface compatibility but is not used in this implementation
-// to filter the results. A different storage layout would be needed for per-repo manifest listing.
-func (d *Driver) ListManifestDigests(ctx context.Context, repoName distribution.RepositoryName) ([]distribution.Digest, error) {
-	manifestRoot := filepath.Join(d.rootDirectory, manifestDataFolder)
-	var digests []distribution.Digest
-	fmt.Fprintf(os.Stderr, "[ListManifestDigests] Walking root: %s\n", manifestRoot)
-
-	err := filepath.WalkDir(manifestRoot, func(path string, entry os.DirEntry, err error) error {
-		entryName := "<nil>"
-		isDir := false
-		if entry != nil {
-			entryName = entry.Name()
-			isDir = entry.IsDir()
-		}
-		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Visiting Path: %s, EntryName: %s, IsDir: %t, Error: %v\n", path, entryName, isDir, err) // More detailed log
-
-		if err != nil {
-			// Log the error but return filepath.SkipDir for the problematic path to allow walking other parts.
-			// If the root itself fails, WalkDir will return the error anyway.
-			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Error accessing %s: %v. Skipping subtree.\n", path, err) // Modified log
-			if os.IsNotExist(err) {
-				return nil // If it doesn't exist, just continue (might be a deleted dir or transient error)
-			}
-			// For permission errors etc., skip the specific directory/file and its contents
-			if entry != nil && entry.IsDir() {
-				return filepath.SkipDir // Skip the directory if we can't access it
-			}
-			return nil // Skip the file if we can't access it
-		}
-
-		// Only process files. Allow WalkDir to descend into directories.
-		if entry.IsDir() {
-			// fmt.Fprintf(os.Stderr, "[ListManifestDigests] Entering directory: %s\n", path) // Optional: Log entering dirs
-			return nil // Continue walking into the directory
-		}
-
-		// Now we know it's a file, process it
-		// We expect files at depth: manifestRoot/{algo}/{shard}/{hash}
-		// Calculate relative path to determine algo and hash
-		relPath, err := filepath.Rel(manifestRoot, path)
-		if err != nil {
-			// Should not happen if path is within manifestRoot
-			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: could not get relative path for manifest %s: %v\n", path, err)
-			return nil // Skip this file
-		}
-		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Processing file: %s (Relative: %s)\n", path, relPath) // Added log
-
-		parts := strings.Split(relPath, string(filepath.Separator))
-		// Expected structure: [algo, shard, hash]
-		if len(parts) != 3 {
-			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: unexpected manifest file structure at %s (parts: %d), skipping\n", path, len(parts)) // Added log
-			return nil                                                                                                                                  // Skip files not matching the expected structure
-		}
-
-		algo := parts[0]
-		hash := parts[2] // The filename is the hash
-
-		// Construct and validate the digest
-		dgstStr := algo + ":" + hash
-		dgst := distribution.Digest(dgstStr)
-		if err := dgst.Validate(); err != nil {
-			fmt.Fprintf(os.Stderr, "[ListManifestDigests] Warning: invalid digest format derived from path %s (%s), skipping: %v\n", path, dgstStr, err) // Added log
-			return nil                                                                                                                                   // Skip invalid digests
-		}
-
-		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Found valid digest: %s\n", dgstStr) // Added log
-		digests = append(digests, dgst)
-		return nil
-	})
-
-	if err != nil {
-		// Handle potential error from WalkDir itself (not errors processed within the walk func)
-		// Check if the root manifest directory doesn't exist, which is not an error, just means no manifests.
-		fmt.Fprintf(os.Stderr, "[ListManifestDigests] Error during WalkDir: %v\n", err) // Added log
-		if _, statErr := os.Stat(manifestRoot); os.IsNotExist(statErr) {
-			return []distribution.Digest{}, nil // Return empty list if root doesn't exist
-		}
-		return nil, fmt.Errorf("error walking manifest directory %s: %w", manifestRoot, err)
-	}
-
-	return digests, nil
-}
+// Note: ListManifestDigests was removed as it's not part of the core OCI spec operations
+// targeted by this interface and can lead to non-standard behavior if implemented globally.
+// Referrer finding relies solely on the tag schema fallback.

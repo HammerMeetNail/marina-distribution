@@ -29,7 +29,28 @@ This registry implements the following parts of the OCI Distribution Specificati
     *   `DELETE /v2/{name}/manifests/{reference}` (Tags and Manifests)
     *   `DELETE /v2/{name}/blobs/{digest}`
 
-See `docs/plan.md` and `docs/referrers_plan.md` for the original implementation plans.
+See `docs/plan.md`, `docs/referrers_plan.md`, and `docs/storage.md` for implementation plans.
+
+## Storage Backend
+
+The registry uses a storage driver abstraction (`pkg/distribution/storage.go`) to handle the persistence of blobs and manifests. This allows for different backend implementations.
+
+Currently, the following storage driver is implemented:
+
+*   **Filesystem:** Stores registry data on the local filesystem.
+
+### Configuration
+
+The storage driver is configured via command-line flags when running the registry:
+
+*   `-storage-path`: Specifies the root directory for the `filesystem` storage driver. Defaults to `./registry-data`.
+
+Example:
+```bash
+go run ./cmd/registry/main.go -storage-path /mnt/registry-storage
+```
+
+Future implementations (e.g., S3, GCS) would likely involve additional configuration options (potentially via a configuration file).
 
 ## Running the Registry
 
