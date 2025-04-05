@@ -4,9 +4,9 @@ import (
 	"fmt"
 
 	"github.com/HammerMeetNail/marina-distribution/internal/storage/filesystem"
+	s3 "github.com/HammerMeetNail/marina-distribution/internal/storage/s3" // Import S3 driver
 	"github.com/HammerMeetNail/marina-distribution/pkg/distribution"
 	// Import other driver packages here when they are implemented
-	// "github.com/HammerMeetNail/marina-distribution/internal/storage/s3"
 	// "github.com/HammerMeetNail/marina-distribution/internal/storage/gcs"
 )
 
@@ -25,9 +25,8 @@ func NewDriver(config distribution.Config) (distribution.StorageDriver, error) {
 		// filesystem.NewDriver now expects distribution.FilesystemConfig
 		return filesystem.NewDriver(config.Filesystem)
 	case distribution.S3DriverType:
-		// Placeholder for S3 driver instantiation
-		// return s3.NewDriver(config.S3)
-		return nil, fmt.Errorf("s3 storage driver is not yet implemented")
+		// Instantiate the S3 driver
+		return s3.NewDriver(config.S3)
 	case distribution.GCSDriverType:
 		// Placeholder for GCS driver instantiation
 		// return gcs.NewDriver(config.GCS)

@@ -31,27 +31,6 @@ This registry implements the following parts of the OCI Distribution Specificati
 
 See `docs/plan.md`, `docs/referrers_plan.md`, and `docs/storage.md` for implementation plans.
 
-## Storage Backend
-
-The registry uses a storage driver abstraction (`pkg/distribution/storage.go`) to handle the persistence of blobs and manifests. This allows for different backend implementations.
-
-Currently, the following storage driver is implemented:
-
-*   **Filesystem:** Stores registry data on the local filesystem.
-
-### Configuration
-
-The storage driver is configured via command-line flags when running the registry:
-
-*   `-storage-path`: Specifies the root directory for the `filesystem` storage driver. Defaults to `./registry-data`.
-
-Example:
-```bash
-go run ./cmd/registry/main.go -storage-path /mnt/registry-storage
-```
-
-Future implementations (e.g., S3, GCS) would likely involve additional configuration options (potentially via a configuration file).
-
 ## Running the Registry
 
 ```bash
@@ -73,6 +52,105 @@ This will create an executable file named `marina-distribution` in the project r
 ```bash
 ./marina-distribution
 ```
+
+## Storage Backend
+
+The registry uses a storage driver abstraction (`pkg/distribution/storage.go`) to handle the persistence of blobs and manifests. This allows for different backend implementations.
+
+Currently, the following storage drivers are implemented:
+
+*   **Filesystem:** Stores registry data on the local filesystem.
+*   **S3:** Stores registry data in an S3-compatible object storage service (like AWS S3 or MinIO).
+
+### Configuration
+
+The storage driver is selected and configured via environment variables when running the registry:
+
+#### Filesystem Driver
+
+*   `STORAGE_DRIVER=filesystem` (This is the default if `STORAGE_DRIVER` is not set)
+*   `STORAGE_PATH`: Specifies the root directory for the `filesystem` storage driver. Defaults to `./registry-data`.
+
+Example:
+```bash
+export STORAGE_DRIVER=filesystem
+export STORAGE_PATH=/mnt/registry-storage
+go run ./cmd/registry/main.go
+```
+
+#### S3 Driver
+
+*   `STORAGE_DRIVER=s3`
+*   `S3_BUCKET`: (Required) The name of the S3 bucket.
+*   `S3_REGION`: (Required for AWS S3) The AWS region of the bucket (e.g., `us-east-1`).
+*   `S3_ENDPOINT`: (Optional, for S3-compatible services like MinIO) The endpoint URL of the S3 service (e.g., `https://localhost:9000`).
+*   `S3_PREFIX`: (Optional) A prefix within the bucket to store registry data under (e.g., `registry`).
+*   `S3_FORCE_PATH_STYLE`: (Optional, usually `true` for MinIO) Set to `true` to force path-style addressing (e.g., `https://endpoint/bucket/key` instead of `https://bucket.endpoint/key`).
+*   `S3_INSECURE_SKIP_VERIFY`: (Optional, **Use with caution!**) Set to `true` to disable TLS certificate verification. Useful for testing with self-signed certificates (like local MinIO). **DO NOT USE IN PRODUCTION.**
+*   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`: (Optional) Standard AWS credentials. If not set, the driver uses the default AWS credential chain (environment variables, shared credentials file, IAM role). These are also used for MinIO if `S3_ENDPOINT` is set.
+
+**Example (AWS S3):**
+
+```bash
+export STORAGE_TYPE=s3
+export S3_BUCKET=test
+export S3_REGION=us-east-1
+export S3_ENDPOINT=https://localhost:9000
+export S3_FORCE_PATH_STYLE=true
+export AWS_ACCESS_KEY_ID=abc
+export AWS_SECRET_ACCESS_KEY=123
+# Ensure AWS credentials are configured via environment or ~/.aws/credentials
+go run ./cmd/registry/main.go
+```
+
+**Example (Local MinIO with Self-Signed Certs):**
+
+This setup is useful for local development and testing.
+
+1.  **Generate Self-Signed Certificates using OpenSSL:**
+    *   Create a directory for certificates: `mkdir -p minio-certs`
+    *   Generate the self-signed certificate:
+        ```bash
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout minio-certs/private.key -out minio-certs/public.crt \
+        -subj "/C=US/ST=State/L=City/O=Organization/OU=OrgUnit/CN=localhost"
+        ```
+
+2.  **Start MinIO with Certificates:**
+    *   Start the MinIO server:
+        ```bash
+        podman run -d --rm \
+        -p 9000:9000 \
+        -p 9001:9001 \
+        --name minio \
+        -e "MINIO_ROOT_USER=minioadmin" \
+        -e "MINIO_ROOT_PASSWORD=minioadmin" \
+        -e "MINIO_CERT_DIR=/root/.minio/certs" \
+        -v ./minio-certs:/root/.minio/certs:Z \
+        -v ./minio-data:/data:Z \
+        minio/minio server /data --console-address ":9001"
+        ```
+        MinIO should automatically pick up the certificates from `./minio-certs` and serve over HTTPS on port 9000.
+
+4.  **Create a Bucket:** Use the MinIO Client (`mc`) or the web console (usually `https://localhost:9001`) to create a bucket (e.g., `registry-data`).
+    ```bash
+    # Install mc: https://min.io/docs/minio/linux/reference/minio-mc.html#install-mc
+    mc alias set localminio https://localhost:9000 minioadmin minioadmin --api s3v4 --insecure
+    mc mb localminio/registry-data --insecure
+    ```
+
+5.  **Run the Registry:**
+    ```bash
+    export STORAGE_DRIVER=s3
+    export S3_BUCKET=registry-data
+    export S3_ENDPOINT=https://localhost:9000
+    export S3_FORCE_PATH_STYLE=true
+    export S3_INSECURE_SKIP_VERIFY=true # Required for self-signed certs
+    export AWS_ACCESS_KEY_ID=minioadmin # Use MinIO credentials
+    export AWS_SECRET_ACCESS_KEY=minioadmin # Use MinIO credentials
+
+    go run ./cmd/registry/main.go
+    ```
 
 ## Running with Podman
 

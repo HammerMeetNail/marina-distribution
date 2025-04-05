@@ -74,9 +74,9 @@ type Config struct {
 	// Used only if Type is "filesystem".
 	Filesystem FilesystemConfig `mapstructure:"filesystem"`
 
-	// S3 holds configuration specific to the S3 driver. (Placeholder)
+	// S3 holds configuration specific to the S3 driver.
 	// Used only if Type is "s3".
-	// S3 S3Config `mapstructure:"s3"`
+	S3 S3Config `mapstructure:"s3"`
 
 	// GCS holds configuration specific to the GCS driver. (Placeholder)
 	// Used only if Type is "gcs".
@@ -97,13 +97,33 @@ func (c *FilesystemConfig) Validate() error {
 	return nil
 }
 
-// S3Config contains configuration for the S3 storage driver. (Placeholder)
-// type S3Config struct {
-// 	Bucket string `mapstructure:"bucket"`
-// 	Region string `mapstructure:"region"`
-// 	Prefix string `mapstructure:"prefix"`
-// 	// Add other S3 specific options: endpoint, credentials (handled externally?), etc.
-// }
+// S3Config contains configuration for the S3 storage driver.
+type S3Config struct {
+	// Bucket is the S3 bucket name. Required.
+	Bucket string `mapstructure:"bucket"`
+	// Region is the AWS region. Optional, but recommended for AWS S3.
+	Region string `mapstructure:"region"`
+	// Endpoint is the S3 API endpoint URL. Optional. Use for S3-compatible storage like Minio.
+	Endpoint string `mapstructure:"endpoint"`
+	// Prefix is an optional path prefix within the bucket for registry data.
+	Prefix string `mapstructure:"prefix"`
+	// ForcePathStyle forces path-style addressing (e.g., `endpoint/bucket/key`).
+	// Required for Minio. Defaults to false (virtual-hosted style). Optional.
+	ForcePathStyle bool `mapstructure:"forcepathstyle"`
+	// InsecureSkipVerify allows skipping TLS certificate verification.
+	// WARNING: Only use for local testing with self-signed certificates. DO NOT USE IN PRODUCTION. Optional. Defaults to false.
+	InsecureSkipVerify bool `mapstructure:"insecureskipverify"`
+	// Note: Credentials are handled via the standard AWS SDK credential chain.
+}
+
+// Validate checks the S3 configuration for errors.
+func (c *S3Config) Validate() error {
+	if c.Bucket == "" {
+		return fmt.Errorf("s3 storage requires a bucket configuration")
+	}
+	// Region is optional but good practice for AWS. Endpoint is optional.
+	return nil
+}
 
 // GCSConfig contains configuration for the GCS storage driver. (Placeholder)
 // type GCSConfig struct {
@@ -120,8 +140,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("filesystem config validation failed: %w", err)
 		}
 	case S3DriverType:
-		return fmt.Errorf("s3 storage driver is not yet implemented")
+		// Validate S3 specific config
+		if err := c.S3.Validate(); err != nil {
+			return fmt.Errorf("s3 config validation failed: %w", err)
+		}
 	case GCSDriverType:
+		// Placeholder for GCS validation
 		return fmt.Errorf("gcs storage driver is not yet implemented")
 	case "":
 		return fmt.Errorf("storage driver type must be specified")

@@ -40,6 +40,41 @@ This plan outlines the steps to refactor the storage layer of the `marina-distri
     *   Define appropriate object key/path structures for the backend.
     *   Translate backend errors to the standard `storage` error types where applicable.
 
+### 5.1 S3 Driver Implementation (`internal/storage/s3`)
+
+This section details the plan for implementing the S3 storage driver.
+
+1.  **Define S3 Configuration (`pkg/distribution/storage.go`)**:
+    *   Define the `S3Config` struct with fields: `Bucket` (string, required), `Region` (string, optional), `Endpoint` (string, optional), `Prefix` (string, optional), `ForcePathStyle` (bool, optional, default `false`).
+    *   Credentials will be handled via the standard AWS SDK credential chain (environment variables, shared config, IAM roles).
+    *   Add `S3 S3Config` field to the main `Config` struct.
+    *   Update `Config.Validate` to call a new `S3Config.Validate()` method which checks for the required `Bucket`.
+
+2.  **Implement S3 Driver (`internal/storage/s3/driver.go`)**:
+    *   Create the directory and file.
+    *   Define a `driver` struct holding `*s3.Client` and `distribution.S3Config`.
+    *   Implement `NewDriver(config distribution.S3Config)`:
+        *   Use `config.LoadDefaultConfig` to load AWS configuration.
+        *   Configure custom endpoint resolver and path style based on `config.Endpoint` and `config.ForcePathStyle`.
+        *   Create and return the `s3.Client` wrapped in the `driver` struct.
+    *   Implement all `distribution.StorageDriver` interface methods:
+        *   Map paths/digests to S3 object keys (e.g., `/<prefix>/blobs/<algo>/<hex>`).
+        *   Use `GetObject`, `PutObject`, `HeadObject`, `DeleteObject` for basic operations.
+        *   Use S3 Multipart Upload APIs (`CreateMultipartUpload`, `UploadPart`, etc.) for resumable uploads.
+        *   Manage tags using dedicated objects (e.g., `/<prefix>/repositories/<repo>/_tags/<tag>`) and `ListObjectsV2`.
+
+3.  **Update Storage Factory (`internal/storage/factory.go`)**:
+    *   Add the import for `internal/storage/s3`.
+    *   Enable the `case distribution.S3DriverType:` to call `s3.NewDriver(config.S3)`.
+
+4.  **Add Go Dependencies**:
+    *   `go get` the required `aws-sdk-go-v2` modules (`config`, `service/s3`, `credentials`, `aws`).
+    *   Run `go mod tidy`.
+
+5.  **Testing with Minio**:
+    *   Provide instructions to run Minio via Docker.
+    *   Detail the necessary environment variables for configuration (`STORAGE_TYPE`, `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_FORCE_PATH_STYLE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+
 6.  **Testing Strategy:**
     *   **Conformance Tests:** Continue using the OCI conformance tests (`run_conformance_tests.sh`) against the registry configured with different drivers (starting with filesystem).
     *   **Driver Unit Tests:** Implement specific unit tests for each `StorageDriver` implementation (starting with `filesystem`). These tests should mock external dependencies (filesystem, cloud APIs) and verify the driver methods adhere to the interface contract, including error handling.

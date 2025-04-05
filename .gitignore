@@ -28,6 +28,7 @@ go.work.sum
 # Test data
 registry-data
 minio-data
+minio-certs
 junit.xml
 report.html
 tests/registry.log

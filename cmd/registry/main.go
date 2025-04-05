@@ -2,8 +2,11 @@ package main
 
 import (
 	"flag" // Import the flag package
+	"fmt"  // Ensure fmt is imported
 	"log"
 	"net/http"
+	"os"      // Import os package to read environment variables
+	"strconv" // Import strconv for boolean parsing
 	"time"
 
 	"github.com/HammerMeetNail/marina-distribution/internal/registry"
@@ -19,15 +22,50 @@ func main() {
 	// Parse the flags
 	flag.Parse()
 
-	// Create storage configuration based on flags
-	// For now, we only support filesystem, hardcoding the type.
-	// A more advanced setup might use a config file (e.g., YAML) parsed with Viper.
-	storageConfig := distribution.Config{
-		Type: distribution.FilesystemDriverType,
-		Filesystem: distribution.FilesystemConfig{
-			RootDirectory: *storagePath,
-		},
-		// Add placeholders for other configs if needed later
+	// Determine storage configuration from environment variables or flags
+	var storageConfig distribution.Config
+	storageType := os.Getenv("STORAGE_TYPE")
+
+	logMessage := "" // To build a dynamic log message
+
+	switch storageType {
+	case string(distribution.S3DriverType):
+		log.Println("Configuring S3 storage driver from environment variables...")
+		bucket := os.Getenv("S3_BUCKET")
+		if bucket == "" {
+			log.Fatal("S3_BUCKET environment variable is required for S3 storage")
+		}
+		forcePathStyle, _ := strconv.ParseBool(os.Getenv("S3_FORCE_PATH_STYLE"))         // Default to false on error
+		insecureSkipVerify, _ := strconv.ParseBool(os.Getenv("S3_INSECURE_SKIP_VERIFY")) // Default to false
+
+		storageConfig = distribution.Config{
+			Type: distribution.S3DriverType,
+			S3: distribution.S3Config{
+				Bucket:             bucket,
+				Region:             os.Getenv("S3_REGION"),   // Optional, SDK might infer
+				Endpoint:           os.Getenv("S3_ENDPOINT"), // Optional, for Minio etc.
+				Prefix:             os.Getenv("S3_PREFIX"),   // Optional
+				ForcePathStyle:     forcePathStyle,
+				InsecureSkipVerify: insecureSkipVerify, // Set from env var
+			},
+		}
+		// Note: AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) are read by the SDK automatically
+		logMessage = fmt.Sprintf("Using %s storage driver with bucket %s", storageConfig.Type, storageConfig.S3.Bucket)
+		if storageConfig.S3.Endpoint != "" {
+			logMessage += fmt.Sprintf(" (endpoint: %s)", storageConfig.S3.Endpoint)
+		}
+
+	case string(distribution.FilesystemDriverType):
+		fallthrough // Treat filesystem explicitly the same as default
+	default:
+		log.Println("Configuring filesystem storage driver from flags...")
+		storageConfig = distribution.Config{
+			Type: distribution.FilesystemDriverType,
+			Filesystem: distribution.FilesystemConfig{
+				RootDirectory: *storagePath,
+			},
+		}
+		logMessage = fmt.Sprintf("Using %s storage driver at %s", storageConfig.Type, storageConfig.Filesystem.RootDirectory)
 	}
 
 	// Initialize storage driver using the factory
@@ -35,7 +73,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize storage driver: %v", err)
 	}
-	log.Printf("Using %s storage driver at %s", storageConfig.Type, storageConfig.Filesystem.RootDirectory)
+	log.Println(logMessage) // Print the configured driver info
 
 	// Use the enhanced http.ServeMux from Go 1.22+
 	mux := http.NewServeMux()
