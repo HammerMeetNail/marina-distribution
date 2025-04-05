@@ -27,6 +27,8 @@ go.work.sum
 
 # Test data
 registry-data
+minio-data
 junit.xml
 report.html
 tests/registry.log
+.env.dev
